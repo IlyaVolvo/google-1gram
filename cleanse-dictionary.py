@@ -29,6 +29,13 @@ MAX_VALIDATED = None          # --size / -s (validated target)
 MIN_FREQUENCY = None          # --min-frequency / -f (stop reading input when below)
 DEBUG = False
 
+DEFAULT_WORKERS = 8
+
+RATE_LIMIT_MAX_RETRIES = 6         # total attempts on 429 (in addition to initial request)
+RATE_LIMIT_BASE_DELAY = 0.75       # seconds
+RATE_LIMIT_MAX_DELAY = 20.0        # cap
+
+
 # output file paths (resolved in main)
 VALIDATED_OUTFILE = None
 REJECTED_OUTFILE = None
@@ -200,34 +207,71 @@ def process_wiktionary_data(lang_section):
 
     return is_validated, is_answer_candidate
 
-def fetch_definition(word: str):
+def fetch_definition(word):
     """
     Calls Wiktionary REST definition endpoint.
-    Returns (status_code, json_dict_or_none)
+    Retries with exponential backoff on HTTP 429 (rate limited).
+    Returns (status_code, json_dict_or_none, url)
     """
     safe_word = quote(word, safe="")
-    url = f"https://en.wiktionary.org/api/rest_v1/page/definition/{safe_word}"
+    url = "https://en.wiktionary.org/api/rest_v1/page/definition/{}".format(safe_word)
     headers = {"User-Agent": "WordValidatorBot/1.0"}
 
-    try:
-        resp = requests.get(url, headers=headers, timeout=(5, 10))
-        if DEBUG:
-            print(f"[DEBUG] REST {resp.status_code} {url}", file=sys.stderr)
-        if resp.status_code != 200:
-            return resp.status_code, None
-        data = resp.json()
-        if DEBUG:
-            if isinstance(data, dict):
-                print(f"[DEBUG] JSON keys: {list(data.keys())}", file=sys.stderr)
-            else:
-                print(f"[DEBUG] JSON type: {type(data)}", file=sys.stderr)
-        if not isinstance(data, dict):
-            return 200, None
-        return 200, data
-    except Exception as e:
-        if DEBUG:
-            print(f"[DEBUG] Exception fetching '{word}': {e}", file=sys.stderr)
-        return -1, None
+    attempt = 0
+    while True:
+        try:
+            resp = requests.get(url, headers=headers, timeout=(5, 10))
+
+            if DEBUG:
+                print("[DEBUG] REST {} {} (attempt {})".format(resp.status_code, url, attempt), file=sys.stderr)
+
+            # --- exponential backoff on 429 ---
+            if resp.status_code == 429:
+                if attempt >= RATE_LIMIT_MAX_RETRIES:
+                    return 429, None, url
+
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = float(retry_after)
+                    except Exception:
+                        delay = None
+                else:
+                    delay = None
+
+                if delay is None:
+                    # exponential backoff with jitter
+                    delay = min(RATE_LIMIT_MAX_DELAY, RATE_LIMIT_BASE_DELAY * (2 ** attempt))
+                    delay = delay * (0.8 + random.random() * 0.4)  # jitter in [0.8, 1.2]
+
+                if INFO:
+                    print("[INFO] 429 rate limited; sleeping {:.2f}s then retrying".format(delay), file=sys.stderr)
+
+                time.sleep(delay)
+                attempt += 1
+                continue
+
+            if resp.status_code != 200:
+                return resp.status_code, None, url
+
+            data = resp.json()
+
+            if DEBUG:
+                if isinstance(data, dict):
+                    print("[DEBUG] JSON keys: {}".format(list(data.keys())), file=sys.stderr)
+                else:
+                    print("[DEBUG] JSON type: {}".format(type(data)), file=sys.stderr)
+
+            if not isinstance(data, dict):
+                return 200, None, url
+
+            return 200, data, url
+
+        except Exception as e:
+            if DEBUG:
+                print("[DEBUG] Exception fetching '{}': {}".format(word, e), file=sys.stderr)
+            return -1, None, url
+
 
 def check_wiktionary(task_data, lang_code, use_cap):
     """
@@ -248,7 +292,7 @@ def check_wiktionary(task_data, lang_code, use_cap):
     status = None
     data = None
     for attempt_word in attempts:
-        status, data = fetch_definition(attempt_word)
+        status, data, _ = fetch_definition(attempt_word)
         if status == 200 and data:
             break
 
@@ -370,6 +414,12 @@ def main():
                         help="Validated output filename. If only a name is given, it is written next to the input file.")
     parser.add_argument("--reset", action="store_true",
                         help="Remove generated artifacts before processing")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="Number of concurrent Wiktionary requests (default: {})".format(DEFAULT_WORKERS)
+    )
 
     # misc
     parser.add_argument("-cap", action="store_true",
@@ -384,8 +434,8 @@ def main():
     MIN_FREQUENCY = args.min_frequency
 
     # outputs next to input (unless -o contains a path)
-    VALIDATED_OUTFILE = resolve_outfile_next_to_input(args.file, args.out, ".validated")
-    REJECTED_OUTFILE = resolve_outfile_next_to_input(args.file, None, ".rejected.csv")
+    VALIDATED_OUTFILE = resolve_outfile_next_to_input(args.file, args.out, "-validated.csv")
+    REJECTED_OUTFILE = resolve_outfile_next_to_input(args.file, None, "-rejected.csv")
 
     if args.reset:
         reset_artifacts(args.file)
@@ -406,7 +456,7 @@ def main():
     print(f"Target validated: {target}. Rejected: {REJECTED_OUTFILE}")
 
     # Process concurrently
-    with ThreadPoolExecutor(max_workers=12) as executor:
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = []
 
         # Submit tasks, but avoid scheduling a huge amount beyond target
@@ -418,6 +468,8 @@ def main():
 
         # Consume results + progress
         for i, future in enumerate(as_completed(futures), 1):
+            future.result()
+
             # flush + report every 100 completed requests
             if i % 100 == 0:
                 flush_outputs()
