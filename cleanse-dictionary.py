@@ -1,124 +1,107 @@
+#!/usr/bin/env python3
 import sys
-import time
-import argparse
 import os
-import threading
-import requests
-import logging
+import re
+import html
+import time
 import socket
+import argparse
+import threading
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
-# Global safety net for hanging sockets
+import requests
+
+# --- GLOBAL SAFETY ---
 socket.setdefaulttimeout(15)
 
-logging.basicConfig(filename="word_validation.log", level=logging.INFO)
-
-# --- GLOBALS ---
+# --- GLOBALS / STATE ---
 stats_lock = threading.Lock()
-files_data = {}
-rej_dictionary_lines = []
-validated_out_lines = []
-VALIDATED_OUTFILE = None
 
+# output buffers (flushed periodically)
+validated_out_lines = []
+rejected_lines = []
+
+# counters / limits
 validated_count = 0
 processed_count = 0
+MAX_VALIDATED = None          # --size / -s (validated target)
+MIN_FREQUENCY = None          # --min-frequency / -f (stop reading input when below)
+DEBUG = False
 
+# output file paths (resolved in main)
+VALIDATED_OUTFILE = None
+REJECTED_OUTFILE = None
 
-def reset_artifacts(input_file):
+# --- HTML stripping for Wiktionary definitions ---
+_TAG_RE = re.compile(r"<[^>]+>")
+
+def strip_html(s: str) -> str:
+    """Remove HTML tags and unescape HTML entities."""
+    if s is None:
+        return ""
+    s = html.unescape(s)
+    return _TAG_RE.sub("", s)
+
+def normalize_term(term: str) -> str:
     """
-    Remove all generated output artifacts:
-    - answers-*.txt
-    - dictionary-*.txt
-    - rejects.txt
-    - log file
-    - *.validated output next to input
+    Strip trailing POS suffix like 'plus_ADV' -> 'plus' ONLY when suffix looks like POS tag.
+    Keeps internal underscores (e.g. multi_word_terms) intact.
+    """
+    term = term.strip()
+    if "_" not in term:
+        return term
+    base, suffix = term.rsplit("_", 1)
+    # Common POS tags are short uppercase alphabetic
+    if suffix.isalpha() and suffix.isupper() and 2 <= len(suffix) <= 6:
+        return base
+    return term
+
+def resolve_outfile_next_to_input(
+    input_file: str,
+    out_arg: Optional[str],
+    default_suffix: str
+) -> str:
+
+    """
+    If out_arg is None -> <input_dir>/<input_base><default_suffix>
+    If out_arg is a filename only -> <input_dir>/<out_arg>
+    If out_arg includes a path -> out_arg as-is
+    """
+    input_dir = os.path.dirname(os.path.abspath(input_file))
+    input_base = os.path.basename(input_file)
+
+    if out_arg:
+        if os.path.dirname(out_arg):
+            return out_arg
+        return os.path.join(input_dir, out_arg)
+
+    return os.path.join(input_dir, input_base + default_suffix)
+
+def reset_artifacts(input_file: str):
+    """
+    Remove artifacts produced by this script:
+    - <input>.validated
+    - <input>.rejected.csv
+    - word_validation.log (if you kept it from earlier iterations)
     """
     base_dir = os.path.dirname(os.path.abspath(input_file))
     base_name = os.path.basename(input_file)
 
-    patterns = [
-        "answers-",
-        "dictionary-",
-    ]
+    validated = os.path.join(base_dir, base_name + ".validated")
+    rejected = os.path.join(base_dir, base_name + ".rejected.csv")
 
-    for fn in os.listdir(base_dir or "."):
-        full = os.path.join(base_dir, fn)
+    for p in (validated, rejected):
+        if os.path.exists(p):
+            os.remove(p)
 
-        # per-length outputs
-        if any(fn.startswith(p) and fn.endswith(".txt") for p in patterns):
-            os.remove(full)
-
-        # rejects
-        elif fn == "rejects.txt":
-            os.remove(full)
-
-        # validated outputs tied to this input
-        elif fn == base_name + ".validated":
-            os.remove(full)
-
-    # log file (global)
+    # optional legacy log cleanup
     if os.path.exists("word_validation.log"):
         os.remove("word_validation.log")
 
-
-def get_all_file_counts(min_len=None, max_len=None):
-    """Calculates current line counts for all output files."""
-    stats = []
-
-    # If min/max aren't provided, infer from lengths seen so far.
-    if min_len is None or max_len is None:
-        if files_data:
-            seen = sorted(files_data.keys())
-            if min_len is None:
-                min_len = seen[0]
-            if max_len is None:
-                max_len = seen[-1]
-        else:
-            return ""
-
-    for length in range(min_len, max_len + 1):
-        ans_fn = f"answers-{length}.txt"
-        dict_fn = f"dictionary-{length}.txt"
-
-        a_count = sum(1 for _ in open(ans_fn)) if os.path.exists(ans_fn) else 0
-        d_count = sum(1 for _ in open(dict_fn)) if os.path.exists(dict_fn) else 0
-
-        if a_count > 0 or d_count > 0:
-            stats.append(f"{length}L: (A:{a_count}/D:{d_count})")
-    return " | ".join(stats)
-
-
-def process_wiktionary_data(lang_data):
-    """Return (fallback_pos, raw_pos_name, is_answer_candidate)."""
-    plural_markers = ["plural of", "formule plurielle", "plural von", "plural de", "forma plural"]
-    proper_markers = ["proper noun", "nom propre", "eigenname", "nombre propio", "surname", "given name"]
-
-    if not lang_data:
-        return None, None, False
-
-    for entry in lang_data:
-        pos_type = entry.get("partOfSpeech", "").lower()
-        is_noun_pos = any(x in pos_type for x in ["noun", "nom", "sustantivo", "substantiv"])
-        is_proper = any(m in pos_type for m in proper_markers)
-
-        # Your existing answer logic: noun + not proper + not plural-of
-        if is_noun_pos and not is_proper:
-            is_plural = False
-            for d_obj in entry.get("definitions", []):
-                text = d_obj.get("definition", "").lower()
-                if any(marker in text for marker in plural_markers):
-                    is_plural = True
-                    break
-            if not is_plural:
-                return "NOUN", pos_type, True
-
-    first_entry = lang_data[0]
-    fallback_pos = first_entry.get("partOfSpeech", "UNKNOWN").upper()
-    return fallback_pos, fallback_pos.lower(), False
-
-
 def extract_pos_list(lang_section):
-    """Collect all PoS values in the language section, deduped, preserved order."""
+    """Collect all PoS values in the language section, deduped, preserve order."""
     pos_list = []
     seen = set()
     for entry in lang_section or []:
@@ -131,314 +114,361 @@ def extract_pos_list(lang_section):
             pos_list.append(pos_u)
     return pos_list
 
+def is_plural_noun_entry(lang_section):
+    """
+    Robust plural detection:
+    - checks definition text after stripping HTML for 'plural of'
+    """
+    plural_markers = (
+        "plural of", "plural form of", "plurals of",
+        "pluriel de", "plural von", "plural de", "forma plural"
+    )
 
-def extract_additional_info(pos_list, lang_section):
-    """Best-effort morphological tags from definition text."""
+    for entry in lang_section or []:
+        for d in entry.get("definitions", []) or []:
+            text = strip_html(d.get("definition", "")).lower()
+            if any(m in text for m in plural_markers):
+                return True
+    return False
+
+def extract_additional_info(pos_list, lang_section, is_answer_candidate: bool):
+    """
+    Best-effort tags (semicolon-separated).
+    Nouns: SINGULAR/PLURAL (based on plural-of detection)
+    Verbs: a few 'form-of' markers inferred from definition text
+    """
     tags = set()
 
-    # Scan definitions once
     def_texts = []
     for entry in lang_section or []:
-        for d_obj in entry.get("definitions", []):
-            t = (d_obj.get("definition") or "").lower()
+        for d_obj in entry.get("definitions", []) or []:
+            t = strip_html(d_obj.get("definition") or "").lower()
             if t:
                 def_texts.append(t)
 
     def contains_any(needles):
         return any(n in t for t in def_texts for n in needles)
 
-    is_noun = any("NOUN" in p or p == "NOM" for p in pos_list)
-    is_verb = any("VERB" in p for p in pos_list)
+    is_noun = any(p == "NOUN" for p in pos_list)
+    is_verb = any(p == "VERB" for p in pos_list)
 
     if is_noun:
-        # plural detection
-        if contains_any(["plural of", "pluriel de", "plural von", "plural de", "forma plural"]):
+        if is_plural_noun_entry(lang_section):
             tags.add("PLURAL")
         else:
             tags.add("SINGULAR")
 
     if is_verb:
-        # common 'form-of' signals; imperfect but useful
-        if contains_any(["past participle", "participle past", "participe passé", "partizip ii"]):
-            tags.add("PAST_PART")
-            tags.add("INFLECTED_FORM")
+        # crude but helpful across many languages in Wiktionary phrasing
+        if contains_any(["past participle", "participe passé", "partizip ii"]):
+            tags.update(["PAST_PART", "INFLECTED_FORM"])
         if contains_any(["present participle", "gerund", "participe présent", "partizip i"]):
-            tags.add("PRES_PART")
-            tags.add("INFLECTED_FORM")
-        if contains_any(["past tense", "simple past", "preterite", "prétérit", "imparfait"]):
-            tags.add("PAST")
-            tags.add("INFLECTED_FORM")
+            tags.update(["PRES_PART", "INFLECTED_FORM"])
+        if contains_any(["past tense", "preterite", "prétérit", "imparfait"]):
+            tags.update(["PAST", "INFLECTED_FORM"])
         if contains_any(["third-person singular", "3rd-person singular", "3rd person singular"]):
-            tags.add("3PS")
-            tags.add("INFLECTED_FORM")
+            tags.update(["3PS", "INFLECTED_FORM"])
         if contains_any(["imperative"]):
-            tags.add("IMP")
-            tags.add("INFLECTED_FORM")
+            tags.update(["IMP", "INFLECTED_FORM"])
         if contains_any(["infinitive"]):
             tags.add("INF")
         if contains_any(["subjunctive"]):
-            tags.add("SUBJ")
-            tags.add("INFLECTED_FORM")
+            tags.update(["SUBJ", "INFLECTED_FORM"])
         if contains_any(["form of", "inflection of", "conjugation of", "conjugated form of"]):
-            tags.add("FORM_OF")
-            tags.add("INFLECTED_FORM")
+            tags.update(["FORM_OF", "INFLECTED_FORM"])
+
+    if is_answer_candidate:
+        tags.add("ANSWER_CANDIDATE")
 
     return ";".join(sorted(tags))
 
+def process_wiktionary_data(lang_section):
+    """
+    Decide if this word is an answer candidate under your current rules:
+      - noun
+      - not proper noun (by partOfSpeech containing 'proper noun')
+      - not plural-of (robust, after stripping HTML)
+    Returns: (is_validated, is_answer_candidate)
+    """
+    if not lang_section:
+        return False, False
 
-def fetch_definition(word, lang_arg):
-    from urllib.parse import quote
+    # A word is "validated" if we got a language section at all.
+    is_validated = True
 
+    # Answer candidate heuristic (Wordle-ish): NOUN, not proper noun, not plural-of
+    is_answer_candidate = False
+    for entry in lang_section:
+        pos_type = (entry.get("partOfSpeech") or "").lower()
+        if "proper noun" in pos_type:
+            continue
+        if "noun" in pos_type:
+            if not is_plural_noun_entry(lang_section):
+                is_answer_candidate = True
+            break
+
+    return is_validated, is_answer_candidate
+
+def fetch_definition(word: str):
+    """
+    Calls Wiktionary REST definition endpoint.
+    Returns (status_code, json_dict_or_none)
+    """
     safe_word = quote(word, safe="")
     url = f"https://en.wiktionary.org/api/rest_v1/page/definition/{safe_word}"
     headers = {"User-Agent": "WordValidatorBot/1.0"}
 
     try:
-        response = requests.get(url, headers=headers, timeout=(5, 10))
-
+        resp = requests.get(url, headers=headers, timeout=(5, 10))
         if DEBUG:
-            print(
-                f"[DEBUG] REST {response.status_code} {url}",
-                file=sys.stderr,
-            )
-
-        if response.status_code != 200:
-            return None
-
-        data = response.json()
-
+            print(f"[DEBUG] REST {resp.status_code} {url}", file=sys.stderr)
+        if resp.status_code != 200:
+            return resp.status_code, None
+        data = resp.json()
         if DEBUG:
             if isinstance(data, dict):
-                print(
-                    f"[DEBUG] JSON keys: {list(data.keys())}",
-                    file=sys.stderr,
-                )
+                print(f"[DEBUG] JSON keys: {list(data.keys())}", file=sys.stderr)
             else:
-                print(
-                    f"[DEBUG] JSON type: {type(data)}",
-                    file=sys.stderr,
-                )
-
+                print(f"[DEBUG] JSON type: {type(data)}", file=sys.stderr)
         if not isinstance(data, dict):
-            return None
-
-        # language code must exist and be non-empty
-        if lang_arg in data and isinstance(data[lang_arg], list) and data[lang_arg]:
-            return data[lang_arg]
-
-        return None
-
+            return 200, None
+        return 200, data
     except Exception as e:
         if DEBUG:
-            print(
-                f"[DEBUG] Exception fetching {word}: {e}",
-                file=sys.stderr,
-            )
-        return None
-
+            print(f"[DEBUG] Exception fetching '{word}': {e}", file=sys.stderr)
+        return -1, None
 
 def check_wiktionary(task_data, lang_code, use_cap):
-    global processed_count
+    """
+    task_data: (word_raw, freq_int, raw_line)
+    Writes either to validated_out_lines or rejected_lines.
+    """
+    global validated_count, processed_count
 
     word_raw, freq, raw_line = task_data
-    length = len(word_raw)
+
+    # Respect validated target early (avoid extra requests if already hit)
+    with stats_lock:
+        if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
+            return False
+
     attempts = [word_raw.capitalize(), word_raw] if use_cap else [word_raw]
 
-    lang_section = None
+    status = None
+    data = None
     for attempt_word in attempts:
-        lang_section = fetch_definition(attempt_word, lang_code)
-        if lang_section:
+        status, data = fetch_definition(attempt_word)
+        if status == 200 and data:
             break
 
-    if lang_section:
-        final_pos, raw_pos_name, is_answer = process_wiktionary_data(lang_section)
+    is_validated = False
+    is_answer_candidate = False
 
-        # Existing per-length outputs
-        formatted_line = f"{word_raw} {freq} {final_pos}\n"
+    if status == 200 and isinstance(data, dict) and (lang_code in data) and isinstance(data[lang_code], list) and data[lang_code]:
+        lang_section = data[lang_code]
+        is_validated, is_answer_candidate = process_wiktionary_data(lang_section)
 
-        # New unified validated output line:
         pos_list = extract_pos_list(lang_section)
-        additional = extract_additional_info(pos_list, lang_section)
-        if is_answer:
-            additional = (additional + (";" if additional else "") + "ANSWER_CANDIDATE")
+        additional = extract_additional_info(pos_list, lang_section, is_answer_candidate)
 
         # word,freq,pos1,pos2,...,posN,additional
         validated_csv = ",".join([word_raw, str(freq)] + pos_list + [additional]) + "\n"
 
         with stats_lock:
-            global validated_count
-
-            # Enforce output size limit
+            # enforce output size limit (validated only)
             if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
+                processed_count += 1
                 return False
-
-            if length not in files_data:
-                files_data[length] = {"answers": [], "dictionary": []}
-
-            files_data[length]["dictionary"].append(formatted_line)
-            if is_answer:
-                files_data[length]["answers"].append(formatted_line)
 
             validated_out_lines.append(validated_csv)
             validated_count += 1
             processed_count += 1
-
         return True
+
+    # Rejected: either 404/not found, rate limited, other http, or parsing mismatch
+    reason = "unknown"
+    if status == 404:
+        reason = "nonexistent"
+    elif status == 429:
+        reason = "rate_limited"
+    elif status is None:
+        reason = "no_status"
+    elif status == -1:
+        reason = "exception"
     else:
-        with stats_lock:
+        reason = f"http_{status}"
 
-            rej_dictionary_lines.append(f"{raw_line},nonexistent\n")
-            processed_count += 1
-        return False
-
-
-def save_files():
     with stats_lock:
-        # Write existing outputs
-        for length, data in files_data.items():
-            for cat in ["answers", "dictionary"]:
-                fn = f"answers-{length}.txt" if cat == "answers" else f"dictionary-{length}.txt"
-                if data[cat]:
-                    with open(fn, "a", encoding="utf-8") as out:
-                        out.writelines(data[cat])
-                    data[cat].clear()
+        rejected_lines.append(f"{raw_line},{reason}\n")
+        processed_count += 1
 
-        # Write rejects
-        if rej_dictionary_lines:
-            with open("rejects.txt", "a", encoding="utf-8") as r:
-                r.writelines(rej_dictionary_lines)
-            rej_dictionary_lines.clear()
+    return False
 
-        # Write unified validated output
-        if VALIDATED_OUTFILE and validated_out_lines:
-            with open(VALIDATED_OUTFILE, "a", encoding="utf-8") as v:
-                v.writelines(validated_out_lines)
+def flush_outputs():
+    with stats_lock:
+        if validated_out_lines:
+            if VALIDATED_OUTFILE:
+                with open(VALIDATED_OUTFILE, "a", encoding="utf-8") as v:
+                    v.writelines(validated_out_lines)
+            else:
+                sys.stdout.writelines(validated_out_lines)
+                sys.stdout.flush()
             validated_out_lines.clear()
 
+        if rejected_lines:
+            if REJECTED_OUTFILE:
+                with open(REJECTED_OUTFILE, "a", encoding="utf-8") as r:
+                    r.writelines(rejected_lines)
+            else:
+                sys.stderr.writelines(rejected_lines)
+                sys.stderr.flush()
+            rejected_lines.clear()
 
-def main():
-    global VALIDATED_OUTFILE
 
-    parser = argparse.ArgumentParser()
-
-    # positional only: language + input file
-    parser.add_argument("lang")
-    parser.add_argument("file")
-
-    # flags (with short forms)
-    parser.add_argument("--min", "-m", dest="min_len", type=int, default=None,
-                        help="Minimum word length (inclusive)")
-    parser.add_argument("--max", "-M", dest="max_len", type=int, default=None,
-                        help="Maximum word length (inclusive)")
-    parser.add_argument("--size", "-s", dest="size", type=int, default=None,
-                        help="Maximum number of validated words to output")
-
-    parser.add_argument("--min-frequency", "-f", dest="min_frequency", type=int, default=None,
-                        help="Stop processing once word frequency drops below this value")
-
-    parser.add_argument("--out", "-o", dest="out", default=None,
-                        help="Unified validated output file (CSV-like)")
-
-    parser.add_argument("-cap", action="store_true",
-                        help="Try capitalized form first")
-
-    parser.add_argument("--reset", action="store_true",
-                    help="Remove all generated artifacts before processing")
-
-    parser.add_argument("--debug", action="store_true",
-                    help="Debug Wiktionary REST calls and responses")
-
-    args = parser.parse_args()
-
-    input_dir = os.path.dirname(os.path.abspath(args.file))
-    input_base = os.path.basename(args.file)
-
-    if args.out:
-        # if user supplied just a filename, put it next to input
-        if os.path.dirname(args.out):
-            VALIDATED_OUTFILE = args.out
-        else:
-            VALIDATED_OUTFILE = os.path.join(input_dir, args.out)
-    else:
-        VALIDATED_OUTFILE = os.path.join(input_dir, input_base + ".validated")
-
-    global MAX_VALIDATED, MIN_FREQUENCY
-    MAX_VALIDATED = args.size
-    MIN_FREQUENCY = args.min_frequency
-
-    if args.reset:
-        reset_artifacts(args.file)
-        print("Artifacts removed (--reset).")
-
-    global DEBUG
-    DEBUG = args.debug
-
-    # touch output (fail fast if unwritable)
-    try:
-        open(VALIDATED_OUTFILE, "a", encoding="utf-8").close()
-    except Exception as e:
-        print(f"ERROR: cannot write to output file {VALIDATED_OUTFILE}: {e}", file=sys.stderr)
-        sys.exit(2)
-
+def parse_input_csv(path, lang_code, min_len, max_len, use_stdin=False):
+    """
+    Reads CSV lines formatted roughly as:
+      term,term_frequency
+      plus_ADV,14199037
+    Applies:
+      - normalize_term()
+      - length filter (if provided)
+      - min-frequency cutoff (stops reading once below threshold; assumes descending sorted)
+    Returns list of tasks (word, freq_int, raw_line)
+    """
     tasks = []
-    with open(args.file, "r", encoding="utf-8") as f:
+    f = sys.stdin if use_stdin else open(path, "r", encoding="utf-8")
+    with f:
         for line in f:
             line = line.strip()
             if not line or "term_frequency" in line:
                 continue
+            parts = line.split(",", 2)
+            if len(parts) < 2:
+                continue
+
+            term = parts[0].strip()
             try:
-                parts = line.split(",")
-                word_raw = parts[0].split("_")[0]
-                freq = int(parts[1])
-
-                # frequency cutoff (assumes descending-sorted input)
-                if MIN_FREQUENCY is not None and freq < MIN_FREQUENCY:
-                    break
-
-                L = len(word_raw)
-                if (args.min_len is None or L >= args.min_len) and (args.max_len is None or L <= args.max_len):
-                    tasks.append((word_raw, freq, line))
+                freq = int(parts[1].strip())
             except Exception:
                 continue
 
-    if args.size is not None and args.size >= 0:
-        tasks = tasks[: args.size]
+            # stop reading further once we drop below min frequency (sorted input)
+            if MIN_FREQUENCY is not None and freq < MIN_FREQUENCY:
+                break
 
-    print(f"Processing {len(tasks)} words. Cap-first: {args.cap}. Out: {VALIDATED_OUTFILE}")
+            word = normalize_term(term)
+            L = len(word)
 
-    count = 0
-    file_stats = ""
-    
+            if (min_len is None or L >= min_len) and (max_len is None or L <= max_len):
+                tasks.append((word, freq, line))
+    return tasks
+
+def main():
+    global MAX_VALIDATED, MIN_FREQUENCY, DEBUG, VALIDATED_OUTFILE, REJECTED_OUTFILE
+
+    parser = argparse.ArgumentParser()
+
+    # only 2 positional parameters
+    parser.add_argument("lang", help="Wiktionary language code (e.g., en, fr, de, ru)")
+    parser.add_argument("file", help="Input CSV file: term,term_frequency")
+
+    # filters / limits
+    parser.add_argument("--min", "-m", dest="min_len", type=int, default=None,
+                        help="Minimum word length (inclusive). Default: no minimum")
+    parser.add_argument("--max", "-M", dest="max_len", type=int, default=None,
+                        help="Maximum word length (inclusive). Default: no maximum")
+    parser.add_argument("--size", "-s", dest="size", type=int, default=None,
+                        help="Target number of VALIDATED outputs to write. Default: unlimited")
+    parser.add_argument("--min-frequency", "-f", dest="min_frequency", type=int, default=None,
+                        help="Stop reading input once frequency drops below this value (assumes sorted input)")
+
+    # output
+    parser.add_argument("--out", "-o", dest="out", default=None,
+                        help="Validated output filename. If only a name is given, it is written next to the input file.")
+    parser.add_argument("--reset", action="store_true",
+                        help="Remove generated artifacts before processing")
+
+    # misc
+    parser.add_argument("-cap", action="store_true",
+                        help="Try capitalized form first")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print REST URL + JSON keys to stderr for debugging")
+
+    args = parser.parse_args()
+
+    use_stdin = (args.file == "-")
+
+    DEBUG = args.debug
+    MAX_VALIDATED = args.size
+    MIN_FREQUENCY = args.min_frequency
+
+    # outputs next to input (unless -o contains a path)
+    if use_stdin:
+        VALIDATED_OUTFILE = None   # stdout
+        REJECTED_OUTFILE = None    # stderr
+    else:
+        VALIDATED_OUTFILE = resolve_outfile_next_to_input(args.file, args.out, ".validated")
+        REJECTED_OUTFILE = resolve_outfile_next_to_input(args.file, None, ".rejected.csv")
+
+
+    if args.reset and not use_stdin:
+        reset_artifacts(args.file)
+        print("Artifacts removed (--reset).")
+
+    # touch output files (fail fast if unwritable)
+    try:
+        open(VALIDATED_OUTFILE, "a", encoding="utf-8").close()
+        open(REJECTED_OUTFILE, "a", encoding="utf-8").close()
+    except Exception as e:
+        print(f"ERROR: cannot write outputs: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    tasks = parse_input_csv(args.file, args.lang, args.min_len, args.max_len, use_stdin)
+
+    target = MAX_VALIDATED if MAX_VALIDATED is not None else "∞"
+    print(f"Processing {len(tasks)} candidate words. Cap-first: {args.cap}. Out: {VALIDATED_OUTFILE}")
+    print(f"Target validated: {target}. Rejected: {REJECTED_OUTFILE}")
+
+    # Process concurrently
     with ThreadPoolExecutor(max_workers=12) as executor:
-        futures = [executor.submit(check_wiktionary, task, args.lang, args.cap) for task in tasks]
-        future_to_word = {fut: task for fut, task in zip(futures, tasks)}
+        futures = []
 
-        for future in as_completed(future_to_word):
-            task_data = future_to_word[future]
-            count += 1
-
-            if count % 100 == 0:
-                save_files()
-                file_stats = get_all_file_counts(args.min_len, args.max_len)
-
-            target = MAX_VALIDATED if MAX_VALIDATED is not None else "∞"
-
+        # Submit tasks, but avoid scheduling a huge amount beyond target
+        for task in tasks:
             with stats_lock:
-                p = processed_count
-                v = validated_count
+                if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
+                    break
+            futures.append(executor.submit(check_wiktionary, task, args.lang, args.cap))
 
-            print(
-                f"\rProcessed:{p}  Validated:{v}/{target}  "
-                f"Current:{task_data[0]:<15}  | {file_stats}",
-                end="",
-                flush=True
-            )
-            # print(f"\r[{count}/{len(tasks)}] Current: {task_data[0]:<15} | {file_stats}", end="", flush=True)
+        # Consume results + progress
+        for i, future in enumerate(as_completed(futures), 1):
+            # flush + report every 100 completed requests
+            if i % 100 == 0:
+                flush_outputs()
+                with stats_lock:
+                    p = processed_count
+                    v = validated_count
+                print(
+                    f"\rProcessed:{p}  Validated:{v}/{target}  LastBatchDone:{i}",
+                    end="",
+                    flush=True
+                )
 
-    save_files()
-    print(f"\nFinal Stats: {get_all_file_counts(args.min_len, args.max_len)}")
-    print("Processing complete.")
+            # If we reached target, we can stop waiting (but threads already running will finish).
+            with stats_lock:
+                if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
+                    break
 
+    flush_outputs()
+
+    with stats_lock:
+        p = processed_count
+        v = validated_count
+        r = "see file"
+    print(f"\nDone. Processed:{p}  Validated:{v}/{target}  Rejected:{r}")
+    print(f"Validated file: {VALIDATED_OUTFILE}")
+    print(f"Rejected file:  {REJECTED_OUTFILE}")
 
 if __name__ == "__main__":
     main()
