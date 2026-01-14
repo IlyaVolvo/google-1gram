@@ -43,6 +43,62 @@ REJECTED_OUTFILE = None
 # --- HTML stripping for Wiktionary definitions ---
 _TAG_RE = re.compile(r"<[^>]+>")
 
+def ensure_csv_input_path(path: str) -> str:
+    """
+    File mode only:
+      - "foo"     -> "foo.csv"
+      - "foo.csv" -> "foo.csv"
+    Rejects other extensions.
+    """
+    if path == "-":
+        return path
+
+    base = os.path.basename(path)
+    root, ext = os.path.splitext(base)
+
+    if ext == "":
+        return path + ".csv"
+    if ext.lower() != ".csv":
+        raise ValueError(f"Input must be a .csv file (or omit extension). Got: {path}")
+    return path
+
+
+def default_out_paths_v2(input_csv_path: str, out_arg_validated: str | None = None):
+    """
+    Given foo.csv, default outputs:
+      validated: foo-VALIDATED.csv
+      rejected:  Rfoo.csv
+
+    If --out/-o is provided:
+      - filename only -> next to input
+      - path included -> use as-is
+    """
+    input_dir = os.path.dirname(os.path.abspath(input_csv_path))
+    base = os.path.basename(input_csv_path)
+    root, ext = os.path.splitext(base)
+
+    # validated
+    if out_arg_validated:
+        if os.path.dirname(out_arg_validated):
+            validated_path = out_arg_validated
+        else:
+            validated_path = os.path.join(input_dir, out_arg_validated)
+    else:
+        validated_path = os.path.join(input_dir, f"{root}-VALIDATED.csv")
+
+    # rejected always defaults
+    rejected_path = os.path.join(input_dir, f"R{root}.csv")
+
+    return validated_path, rejected_path
+
+
+def reset_artifacts_v2(input_csv_path: str):
+    v, r = default_out_paths_v2(input_csv_path, out_arg_validated=None)
+    for p in (v, r):
+        if os.path.exists(p):
+            os.remove(p)
+
+
 def strip_html(s: str) -> str:
     """Remove HTML tags and unescape HTML entities."""
     if s is None:
@@ -352,23 +408,23 @@ def flush_outputs():
                 r.writelines(rejected_lines)
             rejected_lines.clear()
 
-def parse_input_csv(path, lang_code, min_len, max_len):
+def parse_input_csv(path, min_len, max_len, use_stdin):
     """
-    Reads CSV lines formatted roughly as:
-      term,term_frequency
-      plus_ADV,14199037
-    Applies:
-      - normalize_term()
-      - length filter (if provided)
-      - min-frequency cutoff (stops reading once below threshold; assumes descending sorted)
-    Returns list of tasks (word, freq_int, raw_line)
+    Reads CSV lines formatted as: term,term_frequency
+    Returns tasks: (word, freq_int, raw_line)
+    Uses global MIN_FREQUENCY cutoff if set.
     """
     tasks = []
-    with open(path, "r", encoding="utf-8") as f:
+    f = sys.stdin if use_stdin else open(path, "r", encoding="utf-8")
+
+    with f:
         for line in f:
             line = line.strip()
-            if not line or "term_frequency" in line:
+            if not line:
                 continue
+            if "term_frequency" in line:
+                continue
+
             parts = line.split(",", 2)
             if len(parts) < 2:
                 continue
@@ -379,7 +435,6 @@ def parse_input_csv(path, lang_code, min_len, max_len):
             except Exception:
                 continue
 
-            # stop reading further once we drop below min frequency (sorted input)
             if MIN_FREQUENCY is not None and freq < MIN_FREQUENCY:
                 break
 
@@ -388,6 +443,7 @@ def parse_input_csv(path, lang_code, min_len, max_len):
 
             if (min_len is None or L >= min_len) and (max_len is None or L <= max_len):
                 tasks.append((word, freq, line))
+
     return tasks
 
 def main():
@@ -433,13 +489,25 @@ def main():
     MAX_VALIDATED = args.size
     MIN_FREQUENCY = args.min_frequency
 
-    # outputs next to input (unless -o contains a path)
-    VALIDATED_OUTFILE = resolve_outfile_next_to_input(args.file, args.out, "-validated.csv")
-    REJECTED_OUTFILE = resolve_outfile_next_to_input(args.file, None, "-rejected.csv")
+    use_stdin = (args.file == "-")
 
-    if args.reset:
-        reset_artifacts(args.file)
-        print("Artifacts removed (--reset).")
+    # Normalize input filename (file mode only)
+    if not use_stdin:
+        try:
+            args.file = ensure_csv_input_path(args.file)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
+
+    if use_stdin:
+        VALIDATED_OUTFILE = None
+        REJECTED_OUTFILE = None
+    else:
+        VALIDATED_OUTFILE, REJECTED_OUTFILE = default_out_paths_v2(args.file, out_arg_validated=args.out)
+
+    if args.reset and not use_stdin:
+        reset_artifacts_v2(args.file)
+        print("Artifacts removed (--reset).", file=sys.stderr)
 
     # touch output files (fail fast if unwritable)
     try:
@@ -449,7 +517,7 @@ def main():
         print(f"ERROR: cannot write outputs: {e}", file=sys.stderr)
         sys.exit(2)
 
-    tasks = parse_input_csv(args.file, args.lang, args.min_len, args.max_len)
+    tasks = parse_input_csv(args.file, args.min_len, args.max_len, use_stdin)
 
     target = MAX_VALIDATED if MAX_VALIDATED is not None else "∞"
     print(f"Processing {len(tasks)} candidate words. Cap-first: {args.cap}. Out: {VALIDATED_OUTFILE}")
