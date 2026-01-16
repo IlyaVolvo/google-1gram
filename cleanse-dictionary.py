@@ -1,12 +1,40 @@
 #!/usr/bin/env python3
+"""
+Validate words against Wiktionary REST API and emit CSV artifacts.
+
+Input CSV format (assumed):
+  term,term_frequency
+  plus_ADV,14199037
+
+Validated output CSV lines:
+  <word>,<frequency>,<PoS1>,...,<PoSN>,<additional>
+
+Additional:
+  - NOUN: SINGULAR or PLURAL
+  - VERB: best-effort tags inferred from definition text
+
+Artifacts (file mode), for input foo.csv:
+  foo-VALIDATED.csv     (validated words)
+  Nfoo.csv              (404: non-existent)
+  Rfoo.csv              (other failures: 429, 5xx, exceptions, etc.)
+  foo-REJECTED.csv      (SKIPPED: page exists but DOES NOT contain requested locale section)
+
+STDIN mode:
+  file argument "-" reads from STDIN
+  validated -> STDOUT
+  others    -> STDERR (nonexistent, rejected, locale-skipped)
+"""
+
 import sys
 import os
 import re
 import html
 import time
+import random
 import socket
 import argparse
 import threading
+from typing import Optional, Tuple, List, Dict, Any
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -18,30 +46,59 @@ socket.setdefaulttimeout(15)
 # --- GLOBALS / STATE ---
 stats_lock = threading.Lock()
 
-# output buffers (flushed periodically)
-validated_out_lines = []
-rejected_lines = []
+validated_out_lines: List[str] = []
+rejected_lines: List[str] = []
+nonexistent_lines: List[str] = []
+locale_skipped_lines: List[str] = []
 
-# counters / limits
 validated_count = 0
 processed_count = 0
-MAX_VALIDATED = None          # --size / -s (validated target)
-MIN_FREQUENCY = None          # --min-frequency / -f (stop reading input when below)
+skipped_count = 0
+rejected_count = 0
+nonexistent_count = 0
+last_processed_word: Optional[str] = None
+
+MAX_VALIDATED: Optional[int] = None          # --size / -s (validated output target)
+MIN_FREQUENCY: Optional[int] = None          # --min-frequency / -f (stop reading input when below)
 DEBUG = False
+
+VALIDATED_OUTFILE: Optional[str] = None      # file path or None -> stdout
+REJECTED_OUTFILE: Optional[str] = None       # file path or None -> stderr (R<base>.csv)
+NONEXISTENT_OUTFILE: Optional[str] = None    # file path or None -> stderr (N<base>.csv)
+LOCALE_REJECTED_OUTFILE: Optional[str] = None  # file path or None -> stderr (<base>-REJECTED.csv)
 
 DEFAULT_WORKERS = 8
 
-RATE_LIMIT_MAX_RETRIES = 6         # total attempts on 429 (in addition to initial request)
-RATE_LIMIT_BASE_DELAY = 0.75       # seconds
-RATE_LIMIT_MAX_DELAY = 20.0        # cap
-
-
-# output file paths (resolved in main)
-VALIDATED_OUTFILE = None
-REJECTED_OUTFILE = None
+# Rate-limit backoff controls
+RATE_LIMIT_MAX_RETRIES = 6
+RATE_LIMIT_BASE_DELAY = 0.75
+RATE_LIMIT_MAX_DELAY = 20.0
 
 # --- HTML stripping for Wiktionary definitions ---
 _TAG_RE = re.compile(r"<[^>]+>")
+
+
+def strip_html(s: Optional[str]) -> str:
+    """Remove HTML tags and unescape HTML entities."""
+    if s is None:
+        return ""
+    s = html.unescape(s)
+    return _TAG_RE.sub("", s)
+
+
+def normalize_term(term: str) -> str:
+    """
+    Strip trailing POS suffix like 'plus_ADV' -> 'plus' ONLY when suffix looks like POS tag.
+    Keeps internal underscores intact.
+    """
+    term = (term or "").strip()
+    if "_" not in term:
+        return term
+    base, suffix = term.rsplit("_", 1)
+    if suffix.isalpha() and suffix.isupper() and 2 <= len(suffix) <= 6:
+        return base
+    return term
+
 
 def ensure_csv_input_path(path: str) -> str:
     """
@@ -54,7 +111,7 @@ def ensure_csv_input_path(path: str) -> str:
         return path
 
     base = os.path.basename(path)
-    root, ext = os.path.splitext(base)
+    _root, ext = os.path.splitext(base)
 
     if ext == "":
         return path + ".csv"
@@ -63,19 +120,17 @@ def ensure_csv_input_path(path: str) -> str:
     return path
 
 
-def default_out_paths_v2(input_csv_path: str, out_arg_validated: str | None = None):
+def default_out_paths(input_csv_path: str, out_arg_validated: Optional[str] = None) -> Tuple[str, str, str, str]:
     """
-    Given foo.csv, default outputs:
-      validated: foo-VALIDATED.csv
-      rejected:  Rfoo.csv
-
-    If --out/-o is provided:
-      - filename only -> next to input
-      - path included -> use as-is
+    File mode naming for foo.csv:
+      foo-VALIDATED.csv      (validated)
+      Nfoo.csv               (non-existent 404)
+      Rfoo.csv               (other rejects)
+      foo-REJECTED.csv       (locale-skipped: no requested lang section)
     """
     input_dir = os.path.dirname(os.path.abspath(input_csv_path))
     base = os.path.basename(input_csv_path)
-    root, ext = os.path.splitext(base)
+    root, _ext = os.path.splitext(base)
 
     # validated
     if out_arg_validated:
@@ -86,80 +141,23 @@ def default_out_paths_v2(input_csv_path: str, out_arg_validated: str | None = No
     else:
         validated_path = os.path.join(input_dir, f"{root}-VALIDATED.csv")
 
-    # rejected always defaults
+    nonexistent_path = os.path.join(input_dir, f"N{root}.csv")
     rejected_path = os.path.join(input_dir, f"R{root}.csv")
+    locale_rejected_path = os.path.join(input_dir, f"{root}-REJECTED.csv")
 
-    return validated_path, rejected_path
+    return validated_path, nonexistent_path, rejected_path, locale_rejected_path
 
 
-def reset_artifacts_v2(input_csv_path: str):
-    v, r = default_out_paths_v2(input_csv_path, out_arg_validated=None)
-    for p in (v, r):
+def reset_artifacts(input_csv_path: str) -> None:
+    v, n, r, lr = default_out_paths(input_csv_path, out_arg_validated=None)
+    for p in (v, n, r, lr):
         if os.path.exists(p):
             os.remove(p)
 
 
-def strip_html(s: str) -> str:
-    """Remove HTML tags and unescape HTML entities."""
-    if s is None:
-        return ""
-    s = html.unescape(s)
-    return _TAG_RE.sub("", s)
-
-def normalize_term(term: str) -> str:
-    """
-    Strip trailing POS suffix like 'plus_ADV' -> 'plus' ONLY when suffix looks like POS tag.
-    Keeps internal underscores (e.g. multi_word_terms) intact.
-    """
-    term = term.strip()
-    if "_" not in term:
-        return term
-    base, suffix = term.rsplit("_", 1)
-    # Common POS tags are short uppercase alphabetic
-    if suffix.isalpha() and suffix.isupper() and 2 <= len(suffix) <= 6:
-        return base
-    return term
-
-def resolve_outfile_next_to_input(input_file: str, out_arg: str | None, default_suffix: str) -> str:
-    """
-    If out_arg is None -> <input_dir>/<input_base><default_suffix>
-    If out_arg is a filename only -> <input_dir>/<out_arg>
-    If out_arg includes a path -> out_arg as-is
-    """
-    input_dir = os.path.dirname(os.path.abspath(input_file))
-    input_base = os.path.basename(input_file)
-
-    if out_arg:
-        if os.path.dirname(out_arg):
-            return out_arg
-        return os.path.join(input_dir, out_arg)
-
-    return os.path.join(input_dir, input_base + default_suffix)
-
-def reset_artifacts(input_file: str):
-    """
-    Remove artifacts produced by this script:
-    - <input>.validated
-    - <input>.rejected.csv
-    - word_validation.log (if you kept it from earlier iterations)
-    """
-    base_dir = os.path.dirname(os.path.abspath(input_file))
-    base_name = os.path.basename(input_file)
-
-    validated = os.path.join(base_dir, base_name + ".validated")
-    rejected = os.path.join(base_dir, base_name + ".rejected.csv")
-
-    for p in (validated, rejected):
-        if os.path.exists(p):
-            os.remove(p)
-
-    # optional legacy log cleanup
-    if os.path.exists("word_validation.log"):
-        os.remove("word_validation.log")
-
-def extract_pos_list(lang_section):
+def extract_pos_list(lang_section: List[Dict[str, Any]]) -> List[str]:
     """Collect all PoS values in the language section, deduped, preserve order."""
-    pos_list = []
+    pos_list: List[str] = []
     seen = set()
     for entry in lang_section or []:
         pos = (entry.get("partOfSpeech") or "").strip()
@@ -171,14 +169,20 @@ def extract_pos_list(lang_section):
             pos_list.append(pos_u)
     return pos_list
 
-def is_plural_noun_entry(lang_section):
+
+def is_plural_noun_entry(lang_section: List[Dict[str, Any]]) -> bool:
     """
-    Robust plural detection:
-    - checks definition text after stripping HTML for 'plural of'
+    Detect plural noun "form-of" entries by scanning stripped definition text.
+    Example: "<a>plural</a> of <a>year</a>" -> "plural of year".
     """
     plural_markers = (
-        "plural of", "plural form of", "plurals of",
-        "pluriel de", "plural von", "plural de", "forma plural"
+        "plural of",
+        "plural form of",
+        "plurals of",
+        "pluriel de",
+        "plural von",
+        "plural de",
+        "forma plural",
     )
 
     for entry in lang_section or []:
@@ -188,26 +192,31 @@ def is_plural_noun_entry(lang_section):
                 return True
     return False
 
-def extract_additional_info(pos_list, lang_section, is_answer_candidate: bool):
+
+def extract_additional_info(pos_list: List[str], lang_section: List[Dict[str, Any]]) -> str:
     """
-    Best-effort tags (semicolon-separated).
-    Nouns: SINGULAR/PLURAL (based on plural-of detection)
-    Verbs: a few 'form-of' markers inferred from definition text
+    Additional info tags (semicolon-separated).
+      - NOUN: SINGULAR/PLURAL
+      - VERB: best-effort markers inferred from definition text
     """
     tags = set()
 
-    def_texts = []
+    def_texts: List[str] = []
     for entry in lang_section or []:
         for d_obj in entry.get("definitions", []) or []:
             t = strip_html(d_obj.get("definition") or "").lower()
             if t:
                 def_texts.append(t)
 
-    def contains_any(needles):
-        return any(n in t for t in def_texts for n in needles)
+    def contains_any(needles: List[str]) -> bool:
+        for t in def_texts:
+            for n in needles:
+                if n in t:
+                    return True
+        return False
 
-    is_noun = any(p == "NOUN" for p in pos_list)
-    is_verb = any(p == "VERB" for p in pos_list)
+    is_noun = "NOUN" in pos_list
+    is_verb = "VERB" in pos_list
 
     if is_noun:
         if is_plural_noun_entry(lang_section):
@@ -216,7 +225,6 @@ def extract_additional_info(pos_list, lang_section, is_answer_candidate: bool):
             tags.add("SINGULAR")
 
     if is_verb:
-        # crude but helpful across many languages in Wiktionary phrasing
         if contains_any(["past participle", "participe passé", "partizip ii"]):
             tags.update(["PAST_PART", "INFLECTED_FORM"])
         if contains_any(["present participle", "gerund", "participe présent", "partizip i"]):
@@ -236,42 +244,16 @@ def extract_additional_info(pos_list, lang_section, is_answer_candidate: bool):
 
     return ";".join(sorted(tags))
 
-def process_wiktionary_data(lang_section):
-    """
-    Decide if this word is an answer candidate under your current rules:
-      - noun
-      - not proper noun (by partOfSpeech containing 'proper noun')
-      - not plural-of (robust, after stripping HTML)
-    Returns: (is_validated, is_answer_candidate)
-    """
-    if not lang_section:
-        return False, False
 
-    # A word is "validated" if we got a language section at all.
-    is_validated = True
-
-    # Answer candidate heuristic (Wordle-ish): NOUN, not proper noun, not plural-of
-    is_answer_candidate = False
-    for entry in lang_section:
-        pos_type = (entry.get("partOfSpeech") or "").lower()
-        if "proper noun" in pos_type:
-            continue
-        if "noun" in pos_type:
-            if not is_plural_noun_entry(lang_section):
-                is_answer_candidate = True
-            break
-
-    return is_validated, is_answer_candidate
-
-def fetch_definition(word):
+def fetch_definition(word: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
     """
     Calls Wiktionary REST definition endpoint.
     Retries with exponential backoff on HTTP 429 (rate limited).
     Returns (status_code, json_dict_or_none, url)
     """
     safe_word = quote(word, safe="")
-    url = "https://en.wiktionary.org/api/rest_v1/page/definition/{}".format(safe_word)
-    headers = {"User-Agent": "WordValidatorBot/1.0"}
+    url = f"https://en.wiktionary.org/api/rest_v1/page/definition/{safe_word}"
+    headers = {"User-Agent": "WordValidatorBot/1.0 (local script)"}
 
     attempt = 0
     while True:
@@ -279,7 +261,7 @@ def fetch_definition(word):
             resp = requests.get(url, headers=headers, timeout=(5, 10))
 
             if DEBUG:
-                print("[DEBUG] REST {} {} (attempt {})".format(resp.status_code, url, attempt), file=sys.stderr)
+                print(f"[DEBUG] REST {resp.status_code} {url} (attempt {attempt})", file=sys.stderr)
 
             # --- exponential backoff on 429 ---
             if resp.status_code == 429:
@@ -287,21 +269,19 @@ def fetch_definition(word):
                     return 429, None, url
 
                 retry_after = resp.headers.get("Retry-After")
+                delay: Optional[float] = None
                 if retry_after:
                     try:
                         delay = float(retry_after)
                     except Exception:
                         delay = None
-                else:
-                    delay = None
 
                 if delay is None:
-                    # exponential backoff with jitter
                     delay = min(RATE_LIMIT_MAX_DELAY, RATE_LIMIT_BASE_DELAY * (2 ** attempt))
-                    delay = delay * (0.8 + random.random() * 0.4)  # jitter in [0.8, 1.2]
+                    delay *= (0.8 + random.random() * 0.4)  # jitter in [0.8, 1.2]
 
-                if INFO:
-                    print("[INFO] 429 rate limited; sleeping {:.2f}s then retrying".format(delay), file=sys.stderr)
+                if DEBUG:
+                    print(f"[DEBUG] 429 rate limited; sleeping {delay:.2f}s then retrying", file=sys.stderr)
 
                 time.sleep(delay)
                 attempt += 1
@@ -314,9 +294,9 @@ def fetch_definition(word):
 
             if DEBUG:
                 if isinstance(data, dict):
-                    print("[DEBUG] JSON keys: {}".format(list(data.keys())), file=sys.stderr)
+                    print(f"[DEBUG] JSON keys: {list(data.keys())}", file=sys.stderr)
                 else:
-                    print("[DEBUG] JSON type: {}".format(type(data)), file=sys.stderr)
+                    print(f"[DEBUG] JSON type: {type(data)}", file=sys.stderr)
 
             if not isinstance(data, dict):
                 return 200, None, url
@@ -325,96 +305,164 @@ def fetch_definition(word):
 
         except Exception as e:
             if DEBUG:
-                print("[DEBUG] Exception fetching '{}': {}".format(word, e), file=sys.stderr)
+                print(f"[DEBUG] Exception fetching '{word}': {type(e).__name__}: {e}", file=sys.stderr)
             return -1, None, url
 
 
-def check_wiktionary(task_data, lang_code, use_cap):
+def check_wiktionary(task_data: Tuple[str, int, str], lang_code: str, use_cap: bool) -> bool:
     """
     task_data: (word_raw, freq_int, raw_line)
-    Writes either to validated_out_lines or rejected_lines.
+
+    Classification:
+      - 200 + has locale section => VALIDATED
+      - 200 + missing locale section => LOCALE-SKIPPED (written to <base>-REJECTED.csv)
+      - 404 => NONEXISTENT (N<base>.csv)
+      - other failures => REJECTED (R<base>.csv)
     """
-    global validated_count, processed_count
+    global validated_count, processed_count, skipped_count, rejected_count, nonexistent_count, last_processed_word
 
     word_raw, freq, raw_line = task_data
 
-    # Respect validated target early (avoid extra requests if already hit)
     with stats_lock:
         if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
             return False
 
     attempts = [word_raw.capitalize(), word_raw] if use_cap else [word_raw]
 
-    status = None
-    data = None
+    status: Optional[int] = None
+    data: Optional[Dict[str, Any]] = None
+    last_url: str = ""
+
     for attempt_word in attempts:
-        status, data, _ = fetch_definition(attempt_word)
+        status, data, last_url = fetch_definition(attempt_word)
         if status == 200 and data:
             break
+        if status == 404:
+            break  # no need to try other casing if truly missing
 
-    is_validated = False
-    is_answer_candidate = False
+    # 404 => NONEXISTENT output
+    if status == 404:
+        with stats_lock:
+            nonexistent_lines.append(f"{raw_line}\n")
+            nonexistent_count += 1
+            processed_count += 1
+            last_processed_word = word_raw
+        if DEBUG and last_url:
+            print(f"[DEBUG] Nonexistent '{word_raw}' url={last_url}", file=sys.stderr)
+        return False
 
-    if status == 200 and isinstance(data, dict) and (lang_code in data) and isinstance(data[lang_code], list) and data[lang_code]:
-        lang_section = data[lang_code]
-        is_validated, is_answer_candidate = process_wiktionary_data(lang_section)
+    # 200 => either VALIDATED or LOCALE-SKIPPED
+    if status == 200 and isinstance(data, dict):
+        section = data.get(lang_code)
 
+        # Missing/empty locale section => LOCALE-SKIPPED
+        if not (isinstance(section, list) and section):
+            with stats_lock:
+                # keep "rejected schema": raw_line plus a reason column
+                locale_skipped_lines.append(f"{raw_line},wrong_locale\n")
+                skipped_count += 1
+                processed_count += 1
+                last_processed_word = word_raw
+            if DEBUG:
+                print(
+                    f"[DEBUG] Locale-skip '{word_raw}' (no locale '{lang_code}'). Keys={list(data.keys())}",
+                    file=sys.stderr,
+                )
+            return False
+
+        # VALIDATED
+        lang_section = section
         pos_list = extract_pos_list(lang_section)
-        additional = extract_additional_info(pos_list, lang_section, is_answer_candidate)
+        additional = extract_additional_info(pos_list, lang_section)
 
-        # word,freq,pos1,pos2,...,posN,additional
         validated_csv = ",".join([word_raw, str(freq)] + pos_list + [additional]) + "\n"
 
         with stats_lock:
-            # enforce output size limit (validated only)
             if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
+                last_processed_word = word_raw
                 processed_count += 1
                 return False
 
             validated_out_lines.append(validated_csv)
             validated_count += 1
             processed_count += 1
+            last_processed_word = word_raw
+
         return True
 
-    # Rejected: either 404/not found, rate limited, other http, or parsing mismatch
-    reason = "unknown"
-    if status == 404:
-        reason = "nonexistent"
-    elif status == 429:
+    # Other failures => REJECTED output
+    if status == 429:
         reason = "rate_limited"
-    elif status is None:
-        reason = "no_status"
     elif status == -1:
         reason = "exception"
+    elif status is None:
+        reason = "no_status"
     else:
         reason = f"http_{status}"
 
     with stats_lock:
         rejected_lines.append(f"{raw_line},{reason}\n")
+        rejected_count += 1
         processed_count += 1
+        last_processed_word = word_raw
+
+    if DEBUG and last_url:
+        print(f"[DEBUG] Rejected '{word_raw}' reason={reason} url={last_url}", file=sys.stderr)
 
     return False
 
-def flush_outputs():
-    """Flush buffered validated + rejected lines to disk."""
+
+def flush_outputs() -> None:
+    """Flush buffered lines to disk or streams."""
     with stats_lock:
-        if VALIDATED_OUTFILE and validated_out_lines:
-            with open(VALIDATED_OUTFILE, "a", encoding="utf-8") as v:
-                v.writelines(validated_out_lines)
-            validated_out_lines.clear()
+        if validated_out_lines:
+            if VALIDATED_OUTFILE:
+                with open(VALIDATED_OUTFILE, "a", encoding="utf-8") as v:
+                    v.writelines(validated_out_lines)
+            else:
+                sys.stdout.writelines(validated_out_lines)
+                sys.stdout.flush()
+            validated_out_lines[:] = []
 
-        if REJECTED_OUTFILE and rejected_lines:
-            with open(REJECTED_OUTFILE, "a", encoding="utf-8") as r:
-                r.writelines(rejected_lines)
-            rejected_lines.clear()
+        if nonexistent_lines:
+            if NONEXISTENT_OUTFILE:
+                with open(NONEXISTENT_OUTFILE, "a", encoding="utf-8") as n:
+                    n.writelines(nonexistent_lines)
+            else:
+                sys.stderr.writelines(nonexistent_lines)
+                sys.stderr.flush()
+            nonexistent_lines[:] = []
 
-def parse_input_csv(path, min_len, max_len, use_stdin):
+        if rejected_lines:
+            if REJECTED_OUTFILE:
+                with open(REJECTED_OUTFILE, "a", encoding="utf-8") as r:
+                    r.writelines(rejected_lines)
+            else:
+                sys.stderr.writelines(rejected_lines)
+                sys.stderr.flush()
+            rejected_lines[:] = []
+
+        if locale_skipped_lines:
+            if LOCALE_REJECTED_OUTFILE:
+                with open(LOCALE_REJECTED_OUTFILE, "a", encoding="utf-8") as lr:
+                    lr.writelines(locale_skipped_lines)
+            else:
+                sys.stderr.writelines(locale_skipped_lines)
+                sys.stderr.flush()
+            locale_skipped_lines[:] = []
+
+
+def parse_input_csv(path: str, min_len: Optional[int], max_len: Optional[int], use_stdin: bool) -> List[Tuple[str, int, str]]:
     """
-    Reads CSV lines formatted as: term,term_frequency
-    Returns tasks: (word, freq_int, raw_line)
-    Uses global MIN_FREQUENCY cutoff if set.
+    Reads CSV lines formatted as:
+      term,term_frequency
+    Applies:
+      - normalize_term()
+      - length filter (if provided)
+      - min-frequency cutoff (stops reading once below threshold; assumes descending sorted input)
+    Returns tasks: (word, freq, raw_line)
     """
-    tasks = []
+    tasks: List[Tuple[str, int, str]] = []
     f = sys.stdin if use_stdin else open(path, "r", encoding="utf-8")
 
     with f:
@@ -446,14 +494,17 @@ def parse_input_csv(path, min_len, max_len, use_stdin):
 
     return tasks
 
-def main():
-    global MAX_VALIDATED, MIN_FREQUENCY, DEBUG, VALIDATED_OUTFILE, REJECTED_OUTFILE
+
+def main() -> None:
+    global MAX_VALIDATED, MIN_FREQUENCY, DEBUG
+    global VALIDATED_OUTFILE, NONEXISTENT_OUTFILE, REJECTED_OUTFILE, LOCALE_REJECTED_OUTFILE
+    global validated_count, processed_count, skipped_count, rejected_count, nonexistent_count, last_processed_word
 
     parser = argparse.ArgumentParser()
 
-    # only 2 positional parameters
+    # 2 positional parameters
     parser.add_argument("lang", help="Wiktionary language code (e.g., en, fr, de, ru)")
-    parser.add_argument("file", help="Input CSV file: term,term_frequency")
+    parser.add_argument("file", help="Input CSV file (omit .csv allowed) OR '-' for stdin")
 
     # filters / limits
     parser.add_argument("--min", "-m", dest="min_len", type=int, default=None,
@@ -465,19 +516,15 @@ def main():
     parser.add_argument("--min-frequency", "-f", dest="min_frequency", type=int, default=None,
                         help="Stop reading input once frequency drops below this value (assumes sorted input)")
 
-    # output
+    # output (file mode only; stdin mode forces stdout/stderr)
     parser.add_argument("--out", "-o", dest="out", default=None,
-                        help="Validated output filename. If only a name is given, it is written next to the input file.")
+                        help="Validated output filename (file mode). If only a name is given, it is written next to the input file.")
     parser.add_argument("--reset", action="store_true",
-                        help="Remove generated artifacts before processing")
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=DEFAULT_WORKERS,
-        help="Number of concurrent Wiktionary requests (default: {})".format(DEFAULT_WORKERS)
-    )
+                        help="Remove generated artifacts before processing (file mode only)")
 
-    # misc
+    # concurrency / debug
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"Number of concurrent Wiktionary requests (default: {DEFAULT_WORKERS})")
     parser.add_argument("-cap", action="store_true",
                         help="Try capitalized form first")
     parser.add_argument("--debug", action="store_true",
@@ -485,13 +532,17 @@ def main():
 
     args = parser.parse_args()
 
+    if args.workers < 1:
+        print("ERROR: --workers must be >= 1", file=sys.stderr)
+        sys.exit(2)
+
     DEBUG = args.debug
     MAX_VALIDATED = args.size
     MIN_FREQUENCY = args.min_frequency
 
     use_stdin = (args.file == "-")
 
-    # Normalize input filename (file mode only)
+    # Normalize input filename in file mode
     if not use_stdin:
         try:
             args.file = ensure_csv_input_path(args.file)
@@ -499,71 +550,141 @@ def main():
             print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(2)
 
+    # Outputs
     if use_stdin:
         VALIDATED_OUTFILE = None
+        NONEXISTENT_OUTFILE = None
         REJECTED_OUTFILE = None
+        LOCALE_REJECTED_OUTFILE = None
     else:
-        VALIDATED_OUTFILE, REJECTED_OUTFILE = default_out_paths_v2(args.file, out_arg_validated=args.out)
+        VALIDATED_OUTFILE, NONEXISTENT_OUTFILE, REJECTED_OUTFILE, LOCALE_REJECTED_OUTFILE = default_out_paths(
+            args.file, out_arg_validated=args.out
+        )
 
+    # Reset (file mode only)
     if args.reset and not use_stdin:
-        reset_artifacts_v2(args.file)
+        reset_artifacts(args.file)
         print("Artifacts removed (--reset).", file=sys.stderr)
 
-    # touch output files (fail fast if unwritable)
-    try:
-        open(VALIDATED_OUTFILE, "a", encoding="utf-8").close()
-        open(REJECTED_OUTFILE, "a", encoding="utf-8").close()
-    except Exception as e:
-        print(f"ERROR: cannot write outputs: {e}", file=sys.stderr)
-        sys.exit(2)
+    # Touch output files (file mode)
+    if not use_stdin:
+        try:
+            open(VALIDATED_OUTFILE, "a", encoding="utf-8").close()
+            open(NONEXISTENT_OUTFILE, "a", encoding="utf-8").close()
+            open(REJECTED_OUTFILE, "a", encoding="utf-8").close()
+            open(LOCALE_REJECTED_OUTFILE, "a", encoding="utf-8").close()
+        except Exception as e:
+            print(f"ERROR: cannot write outputs: {e}", file=sys.stderr)
+            sys.exit(2)
 
+    # Parse input
     tasks = parse_input_csv(args.file, args.min_len, args.max_len, use_stdin)
 
-    target = MAX_VALIDATED if MAX_VALIDATED is not None else "∞"
-    print(f"Processing {len(tasks)} candidate words. Cap-first: {args.cap}. Out: {VALIDATED_OUTFILE}")
-    print(f"Target validated: {target}. Rejected: {REJECTED_OUTFILE}")
+    target_str = str(MAX_VALIDATED) if MAX_VALIDATED is not None else "∞"
+    if use_stdin:
+        print(
+            f"Processing {len(tasks)} candidate words from STDIN. "
+            f"Cap-first: {args.cap}. Workers: {args.workers}. Target validated: {target_str}.",
+            file=sys.stderr
+        )
+    else:
+        print(
+            f"Processing {len(tasks)} candidate words. "
+            f"Cap-first: {args.cap}. Workers: {args.workers}.",
+            file=sys.stderr
+        )
+        print(f"Validated out:      {VALIDATED_OUTFILE}", file=sys.stderr)
+        print(f"Nonexistent out:    {NONEXISTENT_OUTFILE}", file=sys.stderr)
+        print(f"Rejected out:       {REJECTED_OUTFILE}", file=sys.stderr)
+        print(f"Locale-rejected out:{LOCALE_REJECTED_OUTFILE}", file=sys.stderr)
+        print(f"Target validated: {target_str}", file=sys.stderr)
 
-    # Process concurrently
+    # Reset run counters/buffers (in case of reuse in same process)
+    validated_count = 0
+    processed_count = 0
+    skipped_count = 0
+    rejected_count = 0
+    nonexistent_count = 0
+    last_processed_word = None
+    validated_out_lines.clear()
+    nonexistent_lines.clear()
+    rejected_lines.clear()
+    locale_skipped_lines.clear()
+
+    start_time = time.time()
+
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = []
-
-        # Submit tasks, but avoid scheduling a huge amount beyond target
         for task in tasks:
             with stats_lock:
                 if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
                     break
             futures.append(executor.submit(check_wiktionary, task, args.lang, args.cap))
 
-        # Consume results + progress
         for i, future in enumerate(as_completed(futures), 1):
-            future.result()
-
-            # flush + report every 100 completed requests
-            if i % 100 == 0:
-                flush_outputs()
+            # CRITICAL: surfaces worker exceptions
+            try:
+                future.result()
+            except Exception as e:
+                print(f"\nERROR in worker thread: {type(e).__name__}: {e}", file=sys.stderr)
                 with stats_lock:
-                    p = processed_count
-                    v = validated_count
-                print(
-                    f"\rProcessed:{p}  Validated:{v}/{target}  LastBatchDone:{i}",
-                    end="",
-                    flush=True
-                )
+                    rejected_lines.append(f"__THREAD_EXCEPTION__,{type(e).__name__}:{e}\n")
+                    rejected_count += 1
+                    processed_count += 1
 
-            # If we reached target, we can stop waiting (but threads already running will finish).
             with stats_lock:
                 if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
                     break
 
+            if i % 100 == 0:
+                flush_outputs()
+
+                now = time.time()
+                elapsed = now - start_time
+                with stats_lock:
+                    p = processed_count
+                    v = validated_count
+                    s = skipped_count
+                    ne = nonexistent_count
+                    rj = rejected_count
+                    lastw = last_processed_word
+
+                avg_ms = (elapsed / p * 1000.0) if p else 0.0
+                print(
+                    f"\rProcessed:{p}  Validated:{v}/{target_str}  "
+                    f"LocaleSkipped:{s}  Nonexistent:{ne}  Retry:{rj}  "
+                    f"Elapsed:{elapsed:.1f}s  Avg:{avg_ms:.1f}ms/word  "
+                    f"Last:{lastw or ''}",
+                    end="",
+                    flush=True,
+                    file=sys.stderr
+                )
+
     flush_outputs()
 
+    elapsed = time.time() - start_time
     with stats_lock:
         p = processed_count
         v = validated_count
-        r = "see file"
-    print(f"\nDone. Processed:{p}  Validated:{v}/{target}  Rejected:{r}")
-    print(f"Validated file: {VALIDATED_OUTFILE}")
-    print(f"Rejected file:  {REJECTED_OUTFILE}")
+        s = skipped_count
+        ne = nonexistent_count
+        rj = rejected_count
+        lastw = last_processed_word
+
+    avg_ms = (elapsed / p * 1000.0) if p else 0.0
+
+    print(
+        f"\nDone. Processed:{p}  Validated:{v}/{target_str}  "
+        f"LocaleSkipped:{s}  Nonexistent:{ne}  Retry:{rj}  "
+        f"Elapsed:{elapsed:.1f}s  Avg:{avg_ms:.1f}ms/word",
+        file=sys.stderr
+    )
+
+    if not use_stdin:
+        print(f"Validated file:       {VALIDATED_OUTFILE}", file=sys.stderr)
+        print(f"Nonexistent file:     {NONEXISTENT_OUTFILE}", file=sys.stderr)
+        print(f"Rejected file:        {REJECTED_OUTFILE}", file=sys.stderr)
+        print(f"Locale-rejected file: {LOCALE_REJECTED_OUTFILE}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
