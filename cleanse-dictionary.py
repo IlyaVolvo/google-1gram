@@ -313,104 +313,181 @@ def check_wiktionary(task_data: Tuple[str, int, str], lang_code: str, use_cap: b
     """
     task_data: (word_raw, freq_int, raw_line)
 
-    Classification:
-      - 200 + has locale section => VALIDATED
-      - 200 + missing locale section => LOCALE-SKIPPED (written to <base>-REJECTED.csv)
-      - 404 => NONEXISTENT (N<base>.csv)
-      - other failures => REJECTED (R<base>.csv)
+    With --cap:
+      1) Try non-capitalized first.
+      2) If validated, also probe capitalized:
+         - If capitalized validates: record it too.
+         - If capitalized 404: do nothing.
+         - If capitalized error: skip (do not write R/N).
+      3) If non-capitalized 404: try capitalized normally (R/N/locale-reject as usual).
     """
     global validated_count, processed_count, skipped_count, rejected_count, nonexistent_count, last_processed_word
 
     word_raw, freq, raw_line = task_data
 
+    def record_validated(out_word: str, section: List[Dict[str, Any]]) -> bool:
+        nonlocal freq
+        pos_list = extract_pos_list(section)
+        additional = extract_additional_info(pos_list, section)
+        validated_csv = ",".join([out_word, str(freq)] + pos_list + [additional]) + "\n"
+
+        with stats_lock:
+            if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
+                return False
+            validated_out_lines.append(validated_csv)
+            return True
+
+    def handle_200(data: Dict[str, Any], out_word: str) -> Tuple[bool, bool]:
+        """
+        Returns (validated_success, locale_missing)
+        """
+        section = data.get(lang_code)
+        if not (isinstance(section, list) and section):
+            return (False, True)
+        ok = record_validated(out_word, section)
+        return (ok, False)
+
+    def record_locale_reject() -> None:
+        # keep your "rejected schema": add reason column
+        with stats_lock:
+            locale_skipped_lines.append(f"{raw_line},wrong_locale\n")
+
+    def record_nonexistent() -> None:
+        with stats_lock:
+            nonexistent_lines.append(f"{raw_line}\n")
+
+    def record_rejected(reason: str) -> None:
+        with stats_lock:
+            rejected_lines.append(f"{raw_line},{reason}\n")
+
+    # If already hit target validated, skip work
     with stats_lock:
         if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
             return False
 
-    attempts = [word_raw.capitalize(), word_raw] if use_cap else [word_raw]
+    lower_word = word_raw
+    cap_word = word_raw.capitalize()
 
-    status: Optional[int] = None
-    data: Optional[Dict[str, Any]] = None
-    last_url: str = ""
+    # ---- Helper: run a single probe ----
+    def probe(w: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
+        return fetch_definition(w)
 
-    for attempt_word in attempts:
-        status, data, last_url = fetch_definition(attempt_word)
-        if status == 200 and data:
-            break
-        if status == 404:
-            break  # no need to try other casing if truly missing
+    # ---- 1) Always probe LOWER first if --cap is set, else probe just word_raw ----
+    first_word = lower_word if use_cap else word_raw
+    status1, data1, url1 = probe(first_word)
 
-    # 404 => NONEXISTENT output
-    if status == 404:
+    # ---- Case A: first probe 200 ----
+    if status1 == 200 and isinstance(data1, dict) and data1:
+        validated1, locale_missing1 = handle_200(data1, first_word)
+
         with stats_lock:
-            nonexistent_lines.append(f"{raw_line}\n")
-            nonexistent_count += 1
             processed_count += 1
             last_processed_word = word_raw
-        if DEBUG and last_url:
-            print(f"[DEBUG] Nonexistent '{word_raw}' url={last_url}", file=sys.stderr)
-        return False
-
-    # 200 => either VALIDATED or LOCALE-SKIPPED
-    if status == 200 and isinstance(data, dict):
-        section = data.get(lang_code)
-
-        # Missing/empty locale section => LOCALE-SKIPPED
-        if not (isinstance(section, list) and section):
-            with stats_lock:
-                # keep "rejected schema": raw_line plus a reason column
-                locale_skipped_lines.append(f"{raw_line},wrong_locale\n")
+            if validated1:
+                validated_count += 1
+            elif locale_missing1:
                 skipped_count += 1
-                processed_count += 1
-                last_processed_word = word_raw
-            if DEBUG:
-                print(
-                    f"[DEBUG] Locale-skip '{word_raw}' (no locale '{lang_code}'). Keys={list(data.keys())}",
-                    file=sys.stderr,
-                )
+            else:
+                # 200 but unusable JSON treated as rejected
+                rejected_count += 1
+
+        if locale_missing1:
+            record_locale_reject()
             return False
 
-        # VALIDATED
-        lang_section = section
-        pos_list = extract_pos_list(lang_section)
-        additional = extract_additional_info(pos_list, lang_section)
+        if not validated1:
+            # 200 but couldn't record (e.g., hit MAX_VALIDATED)
+            return False
 
-        validated_csv = ",".join([word_raw, str(freq)] + pos_list + [additional]) + "\n"
+        # If validated and --cap specified: probe Capitalized too
+        if use_cap and cap_word != first_word:
+            status2, data2, url2 = probe(cap_word)
 
-        with stats_lock:
-            if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
-                last_processed_word = word_raw
-                processed_count += 1
-                return False
+            if DEBUG:
+                print(f"[DEBUG] CAP probe result {status2} for {cap_word}", file=sys.stderr)
 
-            validated_out_lines.append(validated_csv)
-            validated_count += 1
-            processed_count += 1
-            last_processed_word = word_raw
+            # If cap validates, record it as well
+            if status2 == 200 and isinstance(data2, dict) and data2:
+                validated2, locale_missing2 = handle_200(data2, cap_word)
+
+                # Rules for second probe:
+                # - locale missing: treat as locale reject? (I'd keep it consistent and record to <base>-REJECTED)
+                #   If you'd rather skip silently, tell me.
+                if locale_missing2:
+                    with stats_lock:
+                        skipped_count += 1
+                    record_locale_reject()
+                elif validated2:
+                    with stats_lock:
+                        validated_count += 1
+                # else: 200 but could not record (MAX_VALIDATED) -> ignore
+
+            elif status2 == 404:
+                # "do nothing for nonexistent" when already succeeded on lower
+                pass
+            else:
+                # "if error skip" when already succeeded on lower
+                pass
 
         return True
 
-    # Other failures => REJECTED output
-    if status == 429:
-        reason = "rate_limited"
-    elif status == -1:
-        reason = "exception"
-    elif status is None:
-        reason = "no_status"
-    else:
-        reason = f"http_{status}"
+    # ---- Case B: first probe 404 ----
+    if status1 == 404:
+        if use_cap and cap_word != first_word:
+            # Try capitalized normally
+            status2, data2, url2 = probe(cap_word)
 
+            if status2 == 200 and isinstance(data2, dict) and data2:
+                validated2, locale_missing2 = handle_200(data2, cap_word)
+
+                with stats_lock:
+                    processed_count += 1
+                    last_processed_word = word_raw
+                    if validated2:
+                        validated_count += 1
+                    elif locale_missing2:
+                        skipped_count += 1
+                    else:
+                        rejected_count += 1
+
+                if locale_missing2:
+                    record_locale_reject()
+                    return False
+                return bool(validated2)
+
+            if status2 == 404:
+                with stats_lock:
+                    processed_count += 1
+                    last_processed_word = word_raw
+                    nonexistent_count += 1
+                record_nonexistent()
+                return False
+
+            # other errors on cap in this branch are handled normally -> rejected
+            reason = "rate_limited" if status2 == 429 else ("exception" if status2 == -1 else f"http_{status2}")
+            with stats_lock:
+                processed_count += 1
+                last_processed_word = word_raw
+                rejected_count += 1
+            record_rejected(reason)
+            return False
+
+        # no cap mode: 404 is nonexistent
+        with stats_lock:
+            processed_count += 1
+            last_processed_word = word_raw
+            nonexistent_count += 1
+        record_nonexistent()
+        return False
+
+    # ---- Case C: first probe error (429/5xx/exception/etc.) handled normally ----
+    reason = "rate_limited" if status1 == 429 else ("exception" if status1 == -1 else f"http_{status1}")
     with stats_lock:
-        rejected_lines.append(f"{raw_line},{reason}\n")
-        rejected_count += 1
         processed_count += 1
         last_processed_word = word_raw
-
-    if DEBUG and last_url:
-        print(f"[DEBUG] Rejected '{word_raw}' reason={reason} url={last_url}", file=sys.stderr)
-
+        rejected_count += 1
+    record_rejected(reason)
     return False
-
 
 def flush_outputs() -> None:
     """Flush buffered lines to disk or streams."""
@@ -525,8 +602,8 @@ def main() -> None:
     # concurrency / debug
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"Number of concurrent Wiktionary requests (default: {DEFAULT_WORKERS})")
-    parser.add_argument("-cap", action="store_true",
-                        help="Try capitalized form first")
+    parser.add_argument("--cap", action="store_true",
+                    help="If set: try lowercase first; if validated, also probe Capitalized (do not penalize 404/errors on the second probe)")
     parser.add_argument("--debug", action="store_true",
                         help="Print REST URL + JSON keys to stderr for debugging")
 
