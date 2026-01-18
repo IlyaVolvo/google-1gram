@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+
+# helpers for word collection postprocessing
+# See loop_cleanse_dictionary.#!/bin/sh
+# See clenase-disctionary.sh
+set -euo pipefail
+IFS=$'\n\t'
+
+PROG="${0##*/}"
+
+die() { echo "[$PROG] $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  tool <command> [args...]
+
+Commands:
+
+Run:
+  tool help <command>
+EOF
+}
+
+# -------- command implementations --------
+
+cmd_hello() {
+  # tool hello [name]
+  local name="${1:-world}"
+  echo "hello, $name"
+}
+
+cmd_help() {
+  # tool help [command]
+  if [[ $# -eq 0 ]]; then
+    usage
+    return 0
+  fi
+
+  local c="$1"
+  if declare -F "cmd_$c" >/dev/null; then
+    # Print the function body comment header as help, if present
+    awk -v fn="cmd_$c" '
+      $0 ~ "^"fn"\\(\\)" {infn=1}
+      infn && $0 ~ /^  #/ {sub(/^  # ?/,""); print; next}
+      infn && $0 !~ /^  #/ && $0 ~ /^}/ {exit}
+    ' "$0" || true
+  else
+    die "unknown command: $c"
+  fi
+}
+
+cmd_clean() {
+  root=$1
+  rm R*${root}.csv N*${root}.csv *-VALIDATED.csv *-REJECTED.csv
+}
+# combine validated_csv
+cmd_combine_valid() {
+  ls -1tr ${1}-VALIDATED.csv | xargs cat >${2:-/dev/stdout}
+}
+# remove duplicates
+cmd_remove_dups() {
+  awk -F',' '!seen[$1]++' ${1:-/dev/stdin}
+}
+cmd_sort_freq() {
+  sort -t',' -k2,2nr ${1:-/dev/stdin}
+}
+# sort by frequency after concatination
+cmd_sort_freq_dups() {
+  awk -F',' '
+    {
+      key = $1
+      freq = $2 + 0
+
+      if (!(key in max) || freq > max[key]) {
+        max[key] = freq
+        row[key] = $0
+      }
+    }
+    END {
+      for (k in row) print row[k]
+    }
+' ${1:-/dev/stdin}
+}
+
+# -------- dispatcher --------
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+
+  case "$cmd" in
+    ""|-h|--help|help) cmd_help "$@";;
+    completion)        cmd_completion "$@";;
+    *)
+      if declare -F "cmd_$cmd" >/dev/null; then
+        "cmd_$cmd" "$@"
+      else
+        die "unknown command: $cmd (try: $PROG help)"
+      fi
+      ;;
+  esac
+}
+
+main "$@"
