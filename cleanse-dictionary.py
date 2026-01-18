@@ -4,25 +4,24 @@ Validate words against Wiktionary REST API and emit CSV artifacts.
 
 Input CSV format (assumed):
   term,term_frequency
-  plus_ADV,14199037
 
 Validated output CSV lines:
   <word>,<frequency>,<PoS1>,...,<PoSN>,<additional>
 
-Additional:
-  - NOUN: SINGULAR or PLURAL
-  - VERB: best-effort tags inferred from definition text
+Additional tags (semicolon-separated, deduped):
+  - NOUN: SINGULAR or PLURAL (best-effort)
+  - VERB: best-effort INFLECTED_FORM markers inferred from definition text
 
 Artifacts (file mode), for input foo.csv:
-  foo-VALIDATED.csv     (validated words)
-  Nfoo.csv              (404: non-existent)
-  Rfoo.csv              (other failures: 429, 5xx, exceptions, etc.)
-  foo-REJECTED.csv      (SKIPPED: page exists but DOES NOT contain requested locale section)
+  foo-VALIDATED.csv   (validated words)
+  Nfoo.csv            (non-existent: both probes 404 when --cap, or single 404 when no --cap)
+  Rfoo.csv            (hard failures: 429/5xx/other http errors)
+  foo-REJECTED.csv    (retry bucket: wrong locale OR ANY probe threw exception)
 
 STDIN mode:
   file argument "-" reads from STDIN
   validated -> STDOUT
-  others    -> STDERR (nonexistent, rejected, locale-skipped)
+  others    -> STDERR (nonexistent, rejected, retry)
 """
 
 import sys
@@ -47,25 +46,25 @@ socket.setdefaulttimeout(15)
 stats_lock = threading.Lock()
 
 validated_out_lines: List[str] = []
-rejected_lines: List[str] = []
-nonexistent_lines: List[str] = []
-locale_skipped_lines: List[str] = []
+hard_rejected_lines: List[str] = []     # R<base>.csv
+nonexistent_lines: List[str] = []       # N<base>.csv
+retry_lines: List[str] = []             # <base>-REJECTED.csv (wrong locale OR exception)
 
 validated_count = 0
 processed_count = 0
-skipped_count = 0
-rejected_count = 0
 nonexistent_count = 0
+hard_rejected_count = 0
+retry_count = 0
 last_processed_word: Optional[str] = None
 
 MAX_VALIDATED: Optional[int] = None          # --size / -s (validated output target)
 MIN_FREQUENCY: Optional[int] = None          # --min-frequency / -f (stop reading input when below)
 DEBUG = False
 
-VALIDATED_OUTFILE: Optional[str] = None      # file path or None -> stdout
-REJECTED_OUTFILE: Optional[str] = None       # file path or None -> stderr (R<base>.csv)
-NONEXISTENT_OUTFILE: Optional[str] = None    # file path or None -> stderr (N<base>.csv)
-LOCALE_REJECTED_OUTFILE: Optional[str] = None  # file path or None -> stderr (<base>-REJECTED.csv)
+VALIDATED_OUTFILE: Optional[str] = None
+NONEXISTENT_OUTFILE: Optional[str] = None
+HARD_REJECTED_OUTFILE: Optional[str] = None
+RETRY_OUTFILE: Optional[str] = None
 
 DEFAULT_WORKERS = 8
 
@@ -79,7 +78,6 @@ _TAG_RE = re.compile(r"<[^>]+>")
 
 
 def strip_html(s: Optional[str]) -> str:
-    """Remove HTML tags and unescape HTML entities."""
     if s is None:
         return ""
     s = html.unescape(s)
@@ -101,18 +99,10 @@ def normalize_term(term: str) -> str:
 
 
 def ensure_csv_input_path(path: str) -> str:
-    """
-    File mode only:
-      - "foo"     -> "foo.csv"
-      - "foo.csv" -> "foo.csv"
-    Rejects other extensions.
-    """
     if path == "-":
         return path
-
     base = os.path.basename(path)
     _root, ext = os.path.splitext(base)
-
     if ext == "":
         return path + ".csv"
     if ext.lower() != ".csv":
@@ -123,16 +113,15 @@ def ensure_csv_input_path(path: str) -> str:
 def default_out_paths(input_csv_path: str, out_arg_validated: Optional[str] = None) -> Tuple[str, str, str, str]:
     """
     File mode naming for foo.csv:
-      foo-VALIDATED.csv      (validated)
-      Nfoo.csv               (non-existent 404)
-      Rfoo.csv               (other rejects)
-      foo-REJECTED.csv       (locale-skipped: no requested lang section)
+      foo-VALIDATED.csv
+      Nfoo.csv
+      Rfoo.csv
+      foo-REJECTED.csv   (retry bucket)
     """
     input_dir = os.path.dirname(os.path.abspath(input_csv_path))
     base = os.path.basename(input_csv_path)
     root, _ext = os.path.splitext(base)
 
-    # validated
     if out_arg_validated:
         if os.path.dirname(out_arg_validated):
             validated_path = out_arg_validated
@@ -142,21 +131,20 @@ def default_out_paths(input_csv_path: str, out_arg_validated: Optional[str] = No
         validated_path = os.path.join(input_dir, f"{root}-VALIDATED.csv")
 
     nonexistent_path = os.path.join(input_dir, f"N{root}.csv")
-    rejected_path = os.path.join(input_dir, f"R{root}.csv")
-    locale_rejected_path = os.path.join(input_dir, f"{root}-REJECTED.csv")
+    hard_rejected_path = os.path.join(input_dir, f"R{root}.csv")
+    retry_path = os.path.join(input_dir, f"{root}-REJECTED.csv")
 
-    return validated_path, nonexistent_path, rejected_path, locale_rejected_path
+    return validated_path, nonexistent_path, hard_rejected_path, retry_path
 
 
 def reset_artifacts(input_csv_path: str) -> None:
-    v, n, r, lr = default_out_paths(input_csv_path, out_arg_validated=None)
-    for p in (v, n, r, lr):
+    v, n, r, rt = default_out_paths(input_csv_path, out_arg_validated=None)
+    for p in (v, n, r, rt):
         if os.path.exists(p):
             os.remove(p)
 
 
 def extract_pos_list(lang_section: List[Dict[str, Any]]) -> List[str]:
-    """Collect all PoS values in the language section, deduped, preserve order."""
     pos_list: List[str] = []
     seen = set()
     for entry in lang_section or []:
@@ -171,10 +159,6 @@ def extract_pos_list(lang_section: List[Dict[str, Any]]) -> List[str]:
 
 
 def is_plural_noun_entry(lang_section: List[Dict[str, Any]]) -> bool:
-    """
-    Detect plural noun "form-of" entries by scanning stripped definition text.
-    Example: "<a>plural</a> of <a>year</a>" -> "plural of year".
-    """
     plural_markers = (
         "plural of",
         "plural form of",
@@ -184,7 +168,6 @@ def is_plural_noun_entry(lang_section: List[Dict[str, Any]]) -> bool:
         "plural de",
         "forma plural",
     )
-
     for entry in lang_section or []:
         for d in entry.get("definitions", []) or []:
             text = strip_html(d.get("definition", "")).lower()
@@ -194,11 +177,6 @@ def is_plural_noun_entry(lang_section: List[Dict[str, Any]]) -> bool:
 
 
 def extract_additional_info(pos_list: List[str], lang_section: List[Dict[str, Any]]) -> str:
-    """
-    Additional info tags (semicolon-separated).
-      - NOUN: SINGULAR/PLURAL
-      - VERB: best-effort markers inferred from definition text
-    """
     tags = set()
 
     def_texts: List[str] = []
@@ -247,9 +225,9 @@ def extract_additional_info(pos_list: List[str], lang_section: List[Dict[str, An
 
 def fetch_definition(word: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
     """
-    Calls Wiktionary REST definition endpoint.
-    Retries with exponential backoff on HTTP 429 (rate limited).
     Returns (status_code, json_dict_or_none, url)
+    status_code == -1 means exception in request/parse.
+    Retries on 429 with exponential backoff.
     """
     safe_word = quote(word, safe="")
     url = f"https://en.wiktionary.org/api/rest_v1/page/definition/{safe_word}"
@@ -263,7 +241,6 @@ def fetch_definition(word: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
             if DEBUG:
                 print(f"[DEBUG] REST {resp.status_code} {url} (attempt {attempt})", file=sys.stderr)
 
-            # --- exponential backoff on 429 ---
             if resp.status_code == 429:
                 if attempt >= RATE_LIMIT_MAX_RETRIES:
                     return 429, None, url
@@ -278,7 +255,7 @@ def fetch_definition(word: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
 
                 if delay is None:
                     delay = min(RATE_LIMIT_MAX_DELAY, RATE_LIMIT_BASE_DELAY * (2 ** attempt))
-                    delay *= (0.8 + random.random() * 0.4)  # jitter in [0.8, 1.2]
+                    delay *= (0.8 + random.random() * 0.4)
 
                 if DEBUG:
                     print(f"[DEBUG] 429 rate limited; sleeping {delay:.2f}s then retrying", file=sys.stderr)
@@ -295,8 +272,6 @@ def fetch_definition(word: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
             if DEBUG:
                 if isinstance(data, dict):
                     print(f"[DEBUG] JSON keys: {list(data.keys())}", file=sys.stderr)
-                else:
-                    print(f"[DEBUG] JSON type: {type(data)}", file=sys.stderr)
 
             if not isinstance(data, dict):
                 return 200, None, url
@@ -309,188 +284,129 @@ def fetch_definition(word: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
             return -1, None, url
 
 
+def _merge_ordered_unique(dst: List[str], src: List[str]) -> None:
+    seen = set(dst)
+    for x in src:
+        if x not in seen:
+            seen.add(x)
+            dst.append(x)
+
+
 def check_wiktionary(task_data: Tuple[str, int, str], lang_code: str, use_cap: bool) -> bool:
     """
-    task_data: (word_raw, freq_int, raw_line)
-
-    With --cap:
-      1) Try non-capitalized first.
-      2) If validated, also probe capitalized:
-         - If capitalized validates: record it too.
-         - If capitalized 404: do nothing.
-         - If capitalized error: skip (do not write R/N).
-      3) If non-capitalized 404: try capitalized normally (R/N/locale-reject as usual).
+    NEW behavior (your request):
+      - If --cap: probe non-cap first AND cap second, then produce ONE output line.
+      - If one probe failed with exception (status == -1): put input line into retry bucket (<base>-REJECTED.csv)
+      - On success: output ONE validated line using the non-cap word (original normalized), with merged tags once.
     """
-    global validated_count, processed_count, skipped_count, rejected_count, nonexistent_count, last_processed_word
+    global validated_count, processed_count, nonexistent_count, hard_rejected_count, retry_count, last_processed_word
 
     word_raw, freq, raw_line = task_data
+    lower = word_raw
+    cap = word_raw.capitalize()
 
-    def record_validated(out_word: str, section: List[Dict[str, Any]]) -> bool:
-        nonlocal freq
-        pos_list = extract_pos_list(section)
-        additional = extract_additional_info(pos_list, section)
-        validated_csv = ",".join([out_word, str(freq)] + pos_list + [additional]) + "\n"
-
-        with stats_lock:
-            if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
-                return False
-            validated_out_lines.append(validated_csv)
-            return True
-
-    def handle_200(data: Dict[str, Any], out_word: str) -> Tuple[bool, bool]:
-        """
-        Returns (validated_success, locale_missing)
-        """
-        section = data.get(lang_code)
-        if not (isinstance(section, list) and section):
-            return (False, True)
-        ok = record_validated(out_word, section)
-        return (ok, False)
-
-    def record_locale_reject() -> None:
-        # keep your "rejected schema": add reason column
-        with stats_lock:
-            locale_skipped_lines.append(f"{raw_line},wrong_locale\n")
-
-    def record_nonexistent() -> None:
-        with stats_lock:
-            nonexistent_lines.append(f"{raw_line}\n")
-
-    def record_rejected(reason: str) -> None:
-        with stats_lock:
-            rejected_lines.append(f"{raw_line},{reason}\n")
-
-    # If already hit target validated, skip work
+    # Early stop if validated target reached
     with stats_lock:
         if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
             return False
 
-    lower_word = word_raw
-    cap_word = word_raw.capitalize()
+    probes: List[Tuple[str, int, Optional[Dict[str, Any]], str]] = []
 
-    # ---- Helper: run a single probe ----
-    def probe(w: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
-        return fetch_definition(w)
+    # Always probe lower first
+    s1, d1, u1 = fetch_definition(lower)
+    probes.append((lower, s1, d1, u1))
 
-    # ---- 1) Always probe LOWER first if --cap is set, else probe just word_raw ----
-    first_word = lower_word if use_cap else word_raw
-    status1, data1, url1 = probe(first_word)
+    # If --cap, probe capitalized as well (second)
+    if use_cap and cap != lower:
+        s2, d2, u2 = fetch_definition(cap)
+        probes.append((cap, s2, d2, u2))
 
-    # ---- Case A: first probe 200 ----
-    if status1 == 200 and isinstance(data1, dict) and data1:
-        validated1, locale_missing1 = handle_200(data1, first_word)
-
+    # If ANY probe threw exception => retry bucket (single line, once)
+    if any(status == -1 for (_w, status, _d, _u) in probes):
         with stats_lock:
+            retry_lines.append(f"{raw_line},exception\n")
+            retry_count += 1
             processed_count += 1
             last_processed_word = word_raw
-            if validated1:
-                validated_count += 1
-            elif locale_missing1:
-                skipped_count += 1
-            else:
-                # 200 but unusable JSON treated as rejected
-                rejected_count += 1
-
-        if locale_missing1:
-            record_locale_reject()
-            return False
-
-        if not validated1:
-            # 200 but couldn't record (e.g., hit MAX_VALIDATED)
-            return False
-
-        # If validated and --cap specified: probe Capitalized too
-        if use_cap and cap_word != first_word:
-            status2, data2, url2 = probe(cap_word)
-
-            if DEBUG:
-                print(f"[DEBUG] CAP probe result {status2} for {cap_word}", file=sys.stderr)
-
-            # If cap validates, record it as well
-            if status2 == 200 and isinstance(data2, dict) and data2:
-                validated2, locale_missing2 = handle_200(data2, cap_word)
-
-                # Rules for second probe:
-                # - locale missing: treat as locale reject? (I'd keep it consistent and record to <base>-REJECTED)
-                #   If you'd rather skip silently, tell me.
-                if locale_missing2:
-                    with stats_lock:
-                        skipped_count += 1
-                    record_locale_reject()
-                elif validated2:
-                    with stats_lock:
-                        validated_count += 1
-                # else: 200 but could not record (MAX_VALIDATED) -> ignore
-
-            elif status2 == 404:
-                # "do nothing for nonexistent" when already succeeded on lower
-                pass
-            else:
-                # "if error skip" when already succeeded on lower
-                pass
-
-        return True
-
-    # ---- Case B: first probe 404 ----
-    if status1 == 404:
-        if use_cap and cap_word != first_word:
-            # Try capitalized normally
-            status2, data2, url2 = probe(cap_word)
-
-            if status2 == 200 and isinstance(data2, dict) and data2:
-                validated2, locale_missing2 = handle_200(data2, cap_word)
-
-                with stats_lock:
-                    processed_count += 1
-                    last_processed_word = word_raw
-                    if validated2:
-                        validated_count += 1
-                    elif locale_missing2:
-                        skipped_count += 1
-                    else:
-                        rejected_count += 1
-
-                if locale_missing2:
-                    record_locale_reject()
-                    return False
-                return bool(validated2)
-
-            if status2 == 404:
-                with stats_lock:
-                    processed_count += 1
-                    last_processed_word = word_raw
-                    nonexistent_count += 1
-                record_nonexistent()
-                return False
-
-            # other errors on cap in this branch are handled normally -> rejected
-            reason = "rate_limited" if status2 == 429 else ("exception" if status2 == -1 else f"http_{status2}")
-            with stats_lock:
-                processed_count += 1
-                last_processed_word = word_raw
-                rejected_count += 1
-            record_rejected(reason)
-            return False
-
-        # no cap mode: 404 is nonexistent
-        with stats_lock:
-            processed_count += 1
-            last_processed_word = word_raw
-            nonexistent_count += 1
-        record_nonexistent()
         return False
 
-    # ---- Case C: first probe error (429/5xx/exception/etc.) handled normally ----
-    reason = "rate_limited" if status1 == 429 else ("exception" if status1 == -1 else f"http_{status1}")
+    # Collect successful (200) locale sections and merge PoS/tags
+    merged_pos: List[str] = []
+    merged_add_tags: List[str] = []
+    any_valid_locale = False
+    any_200_missing_locale = False
+
+    for w, status, data, _url in probes:
+        if status != 200 or not isinstance(data, dict) or not data:
+            continue
+        section = data.get(lang_code)
+        if not (isinstance(section, list) and section):
+            any_200_missing_locale = True
+            continue
+
+        any_valid_locale = True
+        pos = extract_pos_list(section)
+        add = extract_additional_info(pos, section)
+
+        _merge_ordered_unique(merged_pos, pos)
+
+        # merge additional tags (semicolon separated)
+        if add:
+            add_parts = [p for p in add.split(";") if p]
+            _merge_ordered_unique(merged_add_tags, add_parts)
+
+    # If we have at least one valid locale section: write ONE validated line (non-cap)
+    if any_valid_locale:
+        additional = ";".join(sorted(set(merged_add_tags)))
+        validated_csv = ",".join([lower, str(freq)] + merged_pos + [additional]) + "\n"
+
+        with stats_lock:
+            if MAX_VALIDATED is not None and validated_count >= MAX_VALIDATED:
+                processed_count += 1
+                last_processed_word = word_raw
+                return False
+            validated_out_lines.append(validated_csv)
+            validated_count += 1
+            processed_count += 1
+            last_processed_word = word_raw
+        return True
+
+    # If any probe returned 200 but missing locale => retry bucket (wrong locale)
+    if any_200_missing_locale:
+        with stats_lock:
+            retry_lines.append(f"{raw_line},wrong_locale\n")
+            retry_count += 1
+            processed_count += 1
+            last_processed_word = word_raw
+        return False
+
+    # If all probes are 404 => NONEXISTENT
+    if all(status == 404 for (_w, status, _d, _u) in probes):
+        with stats_lock:
+            nonexistent_lines.append(f"{raw_line}\n")
+            nonexistent_count += 1
+            processed_count += 1
+            last_processed_word = word_raw
+        return False
+
+    # Otherwise: hard reject based on the "most important" non-404 status (prefer 429, then other)
+    statuses = [status for (_w, status, _d, _u) in probes]
+    if 429 in statuses:
+        reason = "rate_limited"
+    else:
+        # first non-200/non-404 status
+        bad = next((s for s in statuses if s not in (200, 404)), None)
+        reason = f"http_{bad}" if bad is not None else "unknown_error"
+
     with stats_lock:
+        hard_rejected_lines.append(f"{raw_line},{reason}\n")
+        hard_rejected_count += 1
         processed_count += 1
         last_processed_word = word_raw
-        rejected_count += 1
-    record_rejected(reason)
     return False
 
+
 def flush_outputs() -> None:
-    """Flush buffered lines to disk or streams."""
     with stats_lock:
         if validated_out_lines:
             if VALIDATED_OUTFILE:
@@ -510,35 +426,26 @@ def flush_outputs() -> None:
                 sys.stderr.flush()
             nonexistent_lines[:] = []
 
-        if rejected_lines:
-            if REJECTED_OUTFILE:
-                with open(REJECTED_OUTFILE, "a", encoding="utf-8") as r:
-                    r.writelines(rejected_lines)
+        if hard_rejected_lines:
+            if HARD_REJECTED_OUTFILE:
+                with open(HARD_REJECTED_OUTFILE, "a", encoding="utf-8") as r:
+                    r.writelines(hard_rejected_lines)
             else:
-                sys.stderr.writelines(rejected_lines)
+                sys.stderr.writelines(hard_rejected_lines)
                 sys.stderr.flush()
-            rejected_lines[:] = []
+            hard_rejected_lines[:] = []
 
-        if locale_skipped_lines:
-            if LOCALE_REJECTED_OUTFILE:
-                with open(LOCALE_REJECTED_OUTFILE, "a", encoding="utf-8") as lr:
-                    lr.writelines(locale_skipped_lines)
+        if retry_lines:
+            if RETRY_OUTFILE:
+                with open(RETRY_OUTFILE, "a", encoding="utf-8") as rr:
+                    rr.writelines(retry_lines)
             else:
-                sys.stderr.writelines(locale_skipped_lines)
+                sys.stderr.writelines(retry_lines)
                 sys.stderr.flush()
-            locale_skipped_lines[:] = []
+            retry_lines[:] = []
 
 
 def parse_input_csv(path: str, min_len: Optional[int], max_len: Optional[int], use_stdin: bool) -> List[Tuple[str, int, str]]:
-    """
-    Reads CSV lines formatted as:
-      term,term_frequency
-    Applies:
-      - normalize_term()
-      - length filter (if provided)
-      - min-frequency cutoff (stops reading once below threshold; assumes descending sorted input)
-    Returns tasks: (word, freq, raw_line)
-    """
     tasks: List[Tuple[str, int, str]] = []
     f = sys.stdin if use_stdin else open(path, "r", encoding="utf-8")
 
@@ -574,8 +481,8 @@ def parse_input_csv(path: str, min_len: Optional[int], max_len: Optional[int], u
 
 def main() -> None:
     global MAX_VALIDATED, MIN_FREQUENCY, DEBUG
-    global VALIDATED_OUTFILE, NONEXISTENT_OUTFILE, REJECTED_OUTFILE, LOCALE_REJECTED_OUTFILE
-    global validated_count, processed_count, skipped_count, rejected_count, nonexistent_count, last_processed_word
+    global VALIDATED_OUTFILE, NONEXISTENT_OUTFILE, HARD_REJECTED_OUTFILE, RETRY_OUTFILE
+    global validated_count, processed_count, nonexistent_count, hard_rejected_count, retry_count, last_processed_word
 
     parser = argparse.ArgumentParser()
 
@@ -599,11 +506,11 @@ def main() -> None:
     parser.add_argument("--reset", action="store_true",
                         help="Remove generated artifacts before processing (file mode only)")
 
-    # concurrency / debug
+    # concurrency / debug / cap
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"Number of concurrent Wiktionary requests (default: {DEFAULT_WORKERS})")
     parser.add_argument("--cap", action="store_true",
-                    help="If set: try lowercase first; if validated, also probe Capitalized (do not penalize 404/errors on the second probe)")
+                        help="Probe both lower/capitalized and emit ONE merged validated line (non-cap) if successful")
     parser.add_argument("--debug", action="store_true",
                         help="Print REST URL + JSON keys to stderr for debugging")
 
@@ -619,7 +526,6 @@ def main() -> None:
 
     use_stdin = (args.file == "-")
 
-    # Normalize input filename in file mode
     if not use_stdin:
         try:
             args.file = ensure_csv_input_path(args.file)
@@ -627,66 +533,62 @@ def main() -> None:
             print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(2)
 
-    # Outputs
     if use_stdin:
         VALIDATED_OUTFILE = None
         NONEXISTENT_OUTFILE = None
-        REJECTED_OUTFILE = None
-        LOCALE_REJECTED_OUTFILE = None
+        HARD_REJECTED_OUTFILE = None
+        RETRY_OUTFILE = None
     else:
-        VALIDATED_OUTFILE, NONEXISTENT_OUTFILE, REJECTED_OUTFILE, LOCALE_REJECTED_OUTFILE = default_out_paths(
+        VALIDATED_OUTFILE, NONEXISTENT_OUTFILE, HARD_REJECTED_OUTFILE, RETRY_OUTFILE = default_out_paths(
             args.file, out_arg_validated=args.out
         )
 
-    # Reset (file mode only)
     if args.reset and not use_stdin:
         reset_artifacts(args.file)
         print("Artifacts removed (--reset).", file=sys.stderr)
 
-    # Touch output files (file mode)
     if not use_stdin:
         try:
             open(VALIDATED_OUTFILE, "a", encoding="utf-8").close()
             open(NONEXISTENT_OUTFILE, "a", encoding="utf-8").close()
-            open(REJECTED_OUTFILE, "a", encoding="utf-8").close()
-            open(LOCALE_REJECTED_OUTFILE, "a", encoding="utf-8").close()
+            open(HARD_REJECTED_OUTFILE, "a", encoding="utf-8").close()
+            open(RETRY_OUTFILE, "a", encoding="utf-8").close()
         except Exception as e:
             print(f"ERROR: cannot write outputs: {e}", file=sys.stderr)
             sys.exit(2)
 
-    # Parse input
     tasks = parse_input_csv(args.file, args.min_len, args.max_len, use_stdin)
 
     target_str = str(MAX_VALIDATED) if MAX_VALIDATED is not None else "∞"
     if use_stdin:
         print(
             f"Processing {len(tasks)} candidate words from STDIN. "
-            f"Cap-first: {args.cap}. Workers: {args.workers}. Target validated: {target_str}.",
-            file=sys.stderr
+            f"--cap: {args.cap}. Workers: {args.workers}. Target validated: {target_str}.",
+            file=sys.stderr,
         )
     else:
         print(
             f"Processing {len(tasks)} candidate words. "
-            f"Cap-first: {args.cap}. Workers: {args.workers}.",
-            file=sys.stderr
+            f"--cap: {args.cap}. Workers: {args.workers}.",
+            file=sys.stderr,
         )
-        print(f"Validated out:      {VALIDATED_OUTFILE}", file=sys.stderr)
-        print(f"Nonexistent out:    {NONEXISTENT_OUTFILE}", file=sys.stderr)
-        print(f"Rejected out:       {REJECTED_OUTFILE}", file=sys.stderr)
-        print(f"Locale-rejected out:{LOCALE_REJECTED_OUTFILE}", file=sys.stderr)
+        print(f"Validated out:   {VALIDATED_OUTFILE}", file=sys.stderr)
+        print(f"Nonexistent out: {NONEXISTENT_OUTFILE}", file=sys.stderr)
+        print(f"Hard reject out: {HARD_REJECTED_OUTFILE}", file=sys.stderr)
+        print(f"Retry out:       {RETRY_OUTFILE}", file=sys.stderr)
         print(f"Target validated: {target_str}", file=sys.stderr)
 
-    # Reset run counters/buffers (in case of reuse in same process)
+    # reset run buffers/counters
     validated_count = 0
     processed_count = 0
-    skipped_count = 0
-    rejected_count = 0
     nonexistent_count = 0
+    hard_rejected_count = 0
+    retry_count = 0
     last_processed_word = None
     validated_out_lines.clear()
     nonexistent_lines.clear()
-    rejected_lines.clear()
-    locale_skipped_lines.clear()
+    hard_rejected_lines.clear()
+    retry_lines.clear()
 
     start_time = time.time()
 
@@ -699,14 +601,14 @@ def main() -> None:
             futures.append(executor.submit(check_wiktionary, task, args.lang, args.cap))
 
         for i, future in enumerate(as_completed(futures), 1):
-            # CRITICAL: surfaces worker exceptions
             try:
                 future.result()
             except Exception as e:
+                # Last-resort: if our worker crashes, put line in hard reject bucket
                 print(f"\nERROR in worker thread: {type(e).__name__}: {e}", file=sys.stderr)
                 with stats_lock:
-                    rejected_lines.append(f"__THREAD_EXCEPTION__,{type(e).__name__}:{e}\n")
-                    rejected_count += 1
+                    hard_rejected_lines.append(f"__THREAD_EXCEPTION__,{type(e).__name__}:{e}\n")
+                    hard_rejected_count += 1
                     processed_count += 1
 
             with stats_lock:
@@ -715,26 +617,24 @@ def main() -> None:
 
             if i % 100 == 0:
                 flush_outputs()
-
                 now = time.time()
                 elapsed = now - start_time
                 with stats_lock:
                     p = processed_count
                     v = validated_count
-                    s = skipped_count
                     ne = nonexistent_count
-                    rj = rejected_count
+                    rj = hard_rejected_count
+                    rt = retry_count
                     lastw = last_processed_word
-
                 avg_ms = (elapsed / p * 1000.0) if p else 0.0
                 print(
                     f"\rProcessed:{p}  Validated:{v}/{target_str}  "
-                    f"LocaleSkipped:{s}  Nonexistent:{ne}  Retry:{rj}  "
+                    f"Retry:{rt}  Nonexistent:{ne}  HardRejected:{rj}  "
                     f"Elapsed:{elapsed:.1f}s  Avg:{avg_ms:.1f}ms/word  "
                     f"Last:{lastw or ''}",
                     end="",
                     flush=True,
-                    file=sys.stderr
+                    file=sys.stderr,
                 )
 
     flush_outputs()
@@ -743,25 +643,28 @@ def main() -> None:
     with stats_lock:
         p = processed_count
         v = validated_count
-        s = skipped_count
         ne = nonexistent_count
-        rj = rejected_count
+        rj = hard_rejected_count
+        rt = retry_count
         lastw = last_processed_word
-
     avg_ms = (elapsed / p * 1000.0) if p else 0.0
 
     print(
         f"\nDone. Processed:{p}  Validated:{v}/{target_str}  "
-        f"LocaleSkipped:{s}  Nonexistent:{ne}  Retry:{rj}  "
+        f"Retry:{rt}  Nonexistent:{ne}  HardRejected:{rj}  "
         f"Elapsed:{elapsed:.1f}s  Avg:{avg_ms:.1f}ms/word",
-        file=sys.stderr
+        file=sys.stderr,
     )
 
     if not use_stdin:
-        print(f"Validated file:       {VALIDATED_OUTFILE}", file=sys.stderr)
-        print(f"Nonexistent file:     {NONEXISTENT_OUTFILE}", file=sys.stderr)
-        print(f"Rejected file:        {REJECTED_OUTFILE}", file=sys.stderr)
-        print(f"Locale-rejected file: {LOCALE_REJECTED_OUTFILE}", file=sys.stderr)
+        print(f"Validated file:   {VALIDATED_OUTFILE}", file=sys.stderr)
+        print(f"Nonexistent file: {NONEXISTENT_OUTFILE}", file=sys.stderr)
+        print(f"Hard reject file: {HARD_REJECTED_OUTFILE}", file=sys.stderr)
+        print(f"Retry file:       {RETRY_OUTFILE}", file=sys.stderr)
+
+    if lastw:
+        print(f"Last word processed: {lastw}", file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()
