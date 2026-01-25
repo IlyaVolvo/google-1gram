@@ -3,7 +3,8 @@
 extract_words.py
 
 Reads a "validated" CSV produced by the Wiktionary validator and filters/extracts
-records by frequency, exact length(s), and a boolean tag expression.
+records by frequency, exact length(s), and a boolean expression over tags AND
+word-pattern tokens.
 
 INPUT (one record per line; original information preserved as tags):
   <word>,<frequency>,<PoS1>,...,<PoSN>,<additional>
@@ -19,29 +20,49 @@ OUTPUT FORMAT
 Where <all tags> is:
   PoS tokens (original order), then additional tokens (original order), deduped by first occurrence.
 
-FILTERING
----------
-Instead of -i/--include and -x/--exclude, use a single expression:
-
+FILTERING EXPRESSION
+--------------------
+Use:
   -x / --expr "<boolean expr>"
 
-Operators (case-insensitive tags):
+Operators:
   &   AND
   |   OR
   ^   NOT   (unary, prefix)
   ( ) grouping
 
+Operands:
+  1) TAG token (case-insensitive): e.g. noun, VERB, SINGULAR
+     True iff that tag is present in the record's tag set.
+
+  2) PATTERN token in brackets: [ ... ]
+     True iff the WORD matches the pattern.
+
+     Example:
+       [*ed]        matches words ending in "ed"
+       ^[*ed]       excludes words ending in "ed"
+       noun & ^[*ed]
+
+Pattern semantics:
+  - We treat bracket contents as a simple wildcard pattern:
+      *  matches any sequence (like glob)
+      ?  matches any single character
+    Everything else is treated literally.
+  - Matching is case-insensitive.
+  - The pattern must match the entire word (anchored).
+
 Examples:
   -x noun
   -x "noun | verb"
   -x "noun & ^verb"
+  -x "[*ed]"
+  -x "noun & ^[*ed]"
 """
 
 import argparse
 import sys
-from typing import List, Tuple, Optional, Set, Union
-
-Token = Union[str, tuple]  # str for TAG or op tokens, tuple for ('TAG', name)
+import re
+from typing import List, Tuple, Optional, Set
 
 
 # -------------------- CLI --------------------
@@ -68,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         "-x", "--expr",
         dest="expr",
         default=None,
-        help='Boolean tag expression using &, |, ^, and parentheses. Example: "noun & ^verb"'
+        help='Boolean expression using &, |, ^, (), TAGS and [PATTERNS]. Example: "noun & ^[*ed]"'
     )
 
     return p.parse_args()
@@ -139,8 +160,12 @@ class ExprError(ValueError):
 
 def tokenize_expr(expr: str) -> List[str]:
     """
-    Tokens are: '(', ')', '&', '|', '^', or TAG (alnum/_/-/.)
-    Tags are case-insensitive; we normalize to upper later.
+    Tokens are:
+      - '(', ')', '&', '|', '^'
+      - TAG token (alnum/_/-/.)
+      - PATTERN token in brackets: [ ... ]  (no nesting)
+
+    Example: "noun & ^[*ed]" -> ["noun","&","^","[*ed]"]
     """
     expr = expr.strip()
     if not expr:
@@ -155,13 +180,28 @@ def tokenize_expr(expr: str) -> List[str]:
 
     while i < n:
         ch = expr[i]
+
         if ch.isspace():
             i += 1
             continue
+
         if ch in "()&|^":
             tokens.append(ch)
             i += 1
             continue
+
+        # bracket pattern token: [ ... ]
+        if ch == "[":
+            j = i + 1
+            while j < n and expr[j] != "]":
+                j += 1
+            if j >= n or expr[j] != "]":
+                raise ExprError("Unclosed '[' in expression")
+            tokens.append(expr[i:j + 1])  # include brackets
+            i = j + 1
+            continue
+
+        # normal TAG token
         if is_tag_char(ch):
             j = i + 1
             while j < n and is_tag_char(expr[j]):
@@ -169,6 +209,7 @@ def tokenize_expr(expr: str) -> List[str]:
             tokens.append(expr[i:j])
             i = j
             continue
+
         raise ExprError(f"Invalid character in expression: {ch!r}")
 
     return tokens
@@ -225,12 +266,56 @@ def to_rpn(tokens: List[str]) -> List[str]:
     return output
 
 
-def eval_rpn(rpn: List[str], tagset_upper: Set[str]) -> bool:
+def glob_to_regex(pat: str) -> re.Pattern:
     """
-    Evaluate RPN against a set of tags (already normalized to uppercase).
-    TAG token is True iff TAG in tagset_upper.
+    Convert a simple wildcard pattern to a compiled regex:
+      * -> .*   ? -> .
+    Everything else is literal.
+    Anchored to whole word.
+    Case-insensitive.
+    """
+    # Escape everything, then unescape our wildcards.
+    # We do this by building manually.
+    out = ["^"]
+    for ch in pat:
+        if ch == "*":
+            out.append(".*")
+        elif ch == "?":
+            out.append(".")
+        else:
+            out.append(re.escape(ch))
+    out.append("$")
+    return re.compile("".join(out), re.IGNORECASE)
+
+
+def eval_token(tok: str, word: str, tagset_upper: Set[str], pat_cache: dict) -> bool:
+    """
+    Evaluate an operand token:
+      - TAG: True iff tag in tagset_upper
+      - [pattern]: True iff word matches pattern (case-insensitive)
+    """
+    if tok.startswith("[") and tok.endswith("]"):
+        inner = tok[1:-1]
+        if inner == "":
+            raise ExprError("Empty [] pattern token is not allowed")
+        # cache compiled patterns
+        rx = pat_cache.get(inner)
+        if rx is None:
+            rx = glob_to_regex(inner)
+            pat_cache[inner] = rx
+        return rx.match(word) is not None
+
+    return tok.upper() in tagset_upper
+
+
+def eval_rpn(rpn: List[str], word: str, tagset_upper: Set[str]) -> bool:
+    """
+    Evaluate RPN against:
+      - tag set (upper)
+      - word string (for [pattern] tokens)
     """
     stack: List[bool] = []
+    pat_cache: dict = {}
 
     for tok in rpn:
         if tok == "^":
@@ -247,8 +332,8 @@ def eval_rpn(rpn: List[str], tagset_upper: Set[str]) -> bool:
             stack.append(a and b if tok == "&" else a or b)
             continue
 
-        # TAG
-        stack.append(tok.upper() in tagset_upper)
+        # operand
+        stack.append(eval_token(tok, word, tagset_upper, pat_cache))
 
     if len(stack) != 1:
         raise ExprError("Invalid expression (leftover operands/operators)")
@@ -256,9 +341,6 @@ def eval_rpn(rpn: List[str], tagset_upper: Set[str]) -> bool:
 
 
 def compile_expr(expr: Optional[str]) -> Optional[List[str]]:
-    """
-    Compile expression into RPN tokens, or None if no expression provided.
-    """
     if not expr:
         return None
     toks = tokenize_expr(expr)
@@ -286,7 +368,7 @@ def passes_filters(
         return False
 
     if rpn_expr is not None:
-        return eval_rpn(rpn_expr, tagset_upper)
+        return eval_rpn(rpn_expr, word, tagset_upper)
 
     return True
 
@@ -304,6 +386,8 @@ def main() -> None:
 
     total = 0
     kept = 0
+
+    lengths = args.lengths or []
 
     with open_in(args.input) as fin, open_out(args.out) as fout:
         for raw in fin:
@@ -332,7 +416,7 @@ def main() -> None:
                     tagset_upper=tagset_upper,
                     fmin=args.fmin,
                     fmax=args.fmax,
-                    lengths=args.lengths or [],
+                    lengths=lengths,
                     rpn_expr=rpn,
                 )
             except ExprError as e:
@@ -342,6 +426,7 @@ def main() -> None:
             if not ok:
                 continue
 
+            # Output: <word>\t<frequency>,<all tags>
             if all_tags_ordered:
                 fout.write(f"{word}\t{freq}," + ",".join(all_tags_ordered) + "\n")
             else:

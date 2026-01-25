@@ -6,6 +6,9 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+export LC_ALL=en_US.UTF-8
+export LANG=en_US.UTF-8
+
 PROG="${0##*/}"
 
 die() { echo "[$PROG] $*" >&2; exit 1; }
@@ -82,9 +85,27 @@ cmd_sort_freq_dups() {
     }
 ' ${1:-/dev/stdin}
 }
+cmd_clean_leipzig_corpus(){
+  FILE=${1:-/dev/stdin}
+  MIN="${2:-3}"
+  MAX="${3:-7}"
+
+  awk  -v MIN="$MIN"  -v MAX="$MAX" '
+    NF > 1 && length($2) > MIN && length($2) <= MAX && $2 ~ /^[[:alpha:]]+$/ {
+    for (i = 2; i <= NF; i++) {
+      printf "%s%s", tolower($i), (i < NF ? "," : ORS)
+    }
+  }'  $FILE | awk -F',' '!seen[$1]++'
+}
+# rm *_news_2024_100K-co* *_news_2024_100K-inv_* *_news_2024_100K-s*  *_news_2024_100K-meta*
+
+cmd_freq_leipzig_corpus(){
+  FILE=${1:-/dev/stdin}
+  MIN=${2:-1}
+  awk -F', *' -v MIN=$MIN '$2 >= MIN' $FILE
+}
 
 # -------- dispatcher --------
-
 main() {
   local cmd="${1:-}"
   shift || true
