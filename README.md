@@ -118,7 +118,7 @@ For input `foo.csv`, artifacts are written **next to the input**:
    Hard failures: rate limits, 5xx, network issues (non-exception), other HTTP failures that should be retried later.
 
 * `foo-REJECTED.csv`  
-   Retry bucket: words that were skipped because they do not belong to the requested language section, or cases where one of the required probes failed with an exception (depending on script configuration).
+   Rejected bucket: words that were skipped because they do not belong to the requested language section, or cases where one of the required probes failed with an exception (depending on script configuration).
 
 Note: The naming scheme is intentionally chosen so it’s easy to glob for “R\*” and “N\*”.
 

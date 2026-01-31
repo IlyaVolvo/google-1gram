@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 Validate words against Wiktionary REST API and emit CSV artifacts.
 
@@ -175,9 +176,55 @@ def is_plural_noun_entry(lang_section: List[Dict[str, Any]]) -> bool:
                 return True
     return False
 
+# supposedely extract a tag that tells that the word was borrowed
+def has_transclusion_markup(lang_section: List[Dict[str, Any]]) -> bool:
+    """
+    Detect MediaWiki transclusion markup in Wiktionary REST definition HTML.
+    We check the raw HTML definition string (NOT stripped text), because stripping removes attributes.
+    """
+    for entry in lang_section or []:
+        defs = entry.get("definitions", []) or []
+        for d in defs:
+            raw_html = d.get("definition") or ""
+            if "mw:Transclusion" in raw_html:
+                return True
+    return False
+
+def has_any_example(lang_section) -> bool:
+    """
+    Return True if any definition entry for the target language contains at least one example.
+    Wiktionary REST usually provides examples in 'examples' (list[str]) and/or
+    'parsedExamples' (list[dict] with key 'example').
+    """
+    for entry in (lang_section or []):
+        for d in (entry.get("definitions") or []):
+            ex = d.get("examples")
+            if isinstance(ex, list) and len(ex) > 0:
+                # examples are often strings; we treat presence as enough
+                return True
+
+            pex = d.get("parsedExamples")
+            if isinstance(pex, list) and len(pex) > 0:
+                # parsedExamples are often objects with {"example": "..."}
+                # presence is enough; optionally require non-empty example text:
+                for obj in pex:
+                    if isinstance(obj, dict) and (obj.get("example") or "").strip():
+                        return True
+                # if they are not dicts, just presence is enough
+                return True
+
+    return False
+
 
 def extract_additional_info(pos_list: List[str], lang_section: List[Dict[str, Any]]) -> str:
     tags = set()
+
+    if has_any_example(lang_section):
+        tags.add("HAS_EXAMPLE")
+
+    # MediaWiki transclusion markup present in the definition HTML, seems to be useless
+    #if has_transclusion_markup(lang_section):
+    #    tags.add("TRANSCLUSION")
 
     def_texts: List[str] = []
     for entry in lang_section or []:
