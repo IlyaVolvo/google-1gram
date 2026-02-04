@@ -259,9 +259,13 @@ def extract_additional_info(pos_list: List[str], lang_section: List[Dict[str, An
     if lang_section and isinstance(lang_section, list):
         target_language_name = (lang_section[0].get("language") or "").strip()
 
-    if has_derivative_marker(lang_section, target_language_name):
-        tags.add("DERIVATIVE")
+    hits, total = derivative_coverage(lang_section, target_language_name)
 
+    if total > 0:
+        if hits == total:
+            tags.add("LIKELY_DERIVATIVE")
+        elif hits > 0:
+            tags.add("MAYBE_DERIVATIVE")
 
     # MediaWiki transclusion markup present in the definition HTML, seems to be useless
     #if has_transclusion_markup(lang_section):
@@ -310,21 +314,22 @@ def extract_additional_info(pos_list: List[str], lang_section: List[Dict[str, An
 
     return ";".join(sorted(tags))
 
-def has_derivative_marker(lang_section, target_language_name: str) -> bool:
+def derivative_coverage(lang_section, target_language_name: str):
     """
-    Return True if, within the target-language entries, any definition indicates a derived/form-of sense,
-    detected by:
-      - text contains (form|plural|singular) and ' of '
-      - raw HTML contains '#<target_language_name>' anchor
-      - entry JSON has 'language' == target_language_name
+    Returns (hits, total) where:
+      total = number of definition entries considered for the target language
+      hits  = how many of those match derivative pattern + language anchor
+    A "definition entry" here means each item in entry['definitions'].
     """
     if not target_language_name:
-        return False
+        return (0, 0)
 
     target_anchor = f"#{target_language_name}".lower()
 
+    hits = 0
+    total = 0
+
     for entry in (lang_section or []):
-        # Require the JSON language tag matches the language of interest
         if (entry.get("language") or "").strip() != target_language_name:
             continue
 
@@ -333,17 +338,17 @@ def has_derivative_marker(lang_section, target_language_name: str) -> bool:
             if not raw_html:
                 continue
 
-            # Must contain #<Language> anchor somewhere in the HTML
+            total += 1
+
+            # require the #<Language> anchor to reduce false positives (your requirement)
             if target_anchor not in raw_html.lower():
                 continue
 
-            # Check the visible text for the “plural/singular/form ... of ...” pattern
-            # IMPORTANT: use the same strip_html() you already have in the script.
-            text = strip_html(raw_html).lower()
+            text = strip_html(raw_html)
             if DERIVATIVE_RE.search(text):
-                return True
+                hits += 1
 
-    return False
+    return (hits, total)
 
 
 def fetch_definition(word: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
