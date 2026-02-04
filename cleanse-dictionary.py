@@ -39,6 +39,8 @@ from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+import re
+
 
 # --- GLOBAL SAFETY ---
 socket.setdefaulttimeout(15)
@@ -76,6 +78,37 @@ RATE_LIMIT_MAX_DELAY = 20.0
 
 # --- HTML stripping for Wiktionary definitions ---
 _TAG_RE = re.compile(r"<[^>]+>")
+
+DERIVATIVE_RE = re.compile(
+    r"""(?iu)
+    \b
+    (?:form|inflection|inflected|declension|conjugation|
+       plural|singular|
+       nominative|genitive|dative|accusative|instrumental|prepositional|locative|vocative|ablative|partitive|
+       masculine|feminine|neuter|common|
+       comparative|superlative|
+       past|present|future|imperfect|perfect|pluperfect|
+       participle|gerund|infinitive|
+       subjunctive|imperative|conditional|
+       first|second|third(?:-person)?|person)
+    \b
+    (?:\s+\b
+        (?:form|inflection|inflected|
+           plural|singular|
+           nominative|genitive|dative|accusative|instrumental|prepositional|locative|vocative|ablative|partitive|
+           masculine|feminine|neuter|common|
+           comparative|superlative|
+           past|present|future|imperfect|perfect|pluperfect|
+           participle|gerund|infinitive|
+           subjunctive|imperative|conditional|
+           first|second|third(?:-person)?|person)
+        \b
+    )*
+    \s+
+    (?:of|de|del|della|di|da|du|des|dos|das|do|von|van)\s+
+    """,
+    re.VERBOSE,
+)
 
 
 def strip_html(s: Optional[str]) -> str:
@@ -222,6 +255,14 @@ def extract_additional_info(pos_list: List[str], lang_section: List[Dict[str, An
     if has_any_example(lang_section):
         tags.add("HAS_EXAMPLE")
 
+    target_language_name = ""
+    if lang_section and isinstance(lang_section, list):
+        target_language_name = (lang_section[0].get("language") or "").strip()
+
+    if has_derivative_marker(lang_section, target_language_name):
+        tags.add("DERIVATIVE")
+
+
     # MediaWiki transclusion markup present in the definition HTML, seems to be useless
     #if has_transclusion_markup(lang_section):
     #    tags.add("TRANSCLUSION")
@@ -268,6 +309,41 @@ def extract_additional_info(pos_list: List[str], lang_section: List[Dict[str, An
             tags.update(["FORM_OF", "INFLECTED_FORM"])
 
     return ";".join(sorted(tags))
+
+def has_derivative_marker(lang_section, target_language_name: str) -> bool:
+    """
+    Return True if, within the target-language entries, any definition indicates a derived/form-of sense,
+    detected by:
+      - text contains (form|plural|singular) and ' of '
+      - raw HTML contains '#<target_language_name>' anchor
+      - entry JSON has 'language' == target_language_name
+    """
+    if not target_language_name:
+        return False
+
+    target_anchor = f"#{target_language_name}".lower()
+
+    for entry in (lang_section or []):
+        # Require the JSON language tag matches the language of interest
+        if (entry.get("language") or "").strip() != target_language_name:
+            continue
+
+        for d in (entry.get("definitions") or []):
+            raw_html = (d.get("definition") or "")
+            if not raw_html:
+                continue
+
+            # Must contain #<Language> anchor somewhere in the HTML
+            if target_anchor not in raw_html.lower():
+                continue
+
+            # Check the visible text for the “plural/singular/form ... of ...” pattern
+            # IMPORTANT: use the same strip_html() you already have in the script.
+            text = strip_html(raw_html).lower()
+            if DERIVATIVE_RE.search(text):
+                return True
+
+    return False
 
 
 def fetch_definition(word: str) -> Tuple[int, Optional[Dict[str, Any]], str]:
@@ -404,7 +480,7 @@ def check_wiktionary(task_data: Tuple[str, int, str], lang_code: str, use_cap: b
 
     # If we have at least one valid locale section: write ONE validated line (non-cap)
     if any_valid_locale:
-        additional = ";".join(sorted(set(merged_add_tags)))
+        additional = ",".join(sorted(set(merged_add_tags)))
         validated_csv = ",".join([lower, str(freq)] + merged_pos + [additional]) + "\n"
 
         with stats_lock:

@@ -1,4 +1,4 @@
-The goal of this effort to create form a corpus of words produced ny Google Bigquery list of words a list that could be analyzed and cleaned  programmatically or manually. The following query was used to obtain 50,000 words of length from 4 to 7\.  
+The goal of this effort to create a corpus of words produced typcally by Google Bigquery for a specific language that could be analyzed and cleaned  programmatically or manually. The following query was used to obtain 50,000 words of length from 4 to 7\.  
 `SELECT`  
   `n.term,`  
   `y.term_frequency`  
@@ -9,13 +9,12 @@ The goal of this effort to create form a corpus of words produced ny Google Bigq
  `y.year = 2019`
 
 `-- 1. Filters for the 4 specific tags`  
-`-- ^ [a-z] starts with 4 to 7 lowercase characters and has underscore for PoS`  
- `AND (`  
-   `REGEXP_CONTAINS(n.term, r'^[a-z]{4,7}_NOUN')`  
-   `OR REGEXP_CONTAINS(n.term, r'^[a-z]{4,7}_VERB')`  
-   `OR REGEXP_CONTAINS(n.term, r'^[a-z]{4,7}_ADV')`  
-   `OR REGEXP_CONTAINS(n.term, r'^[a-z]{4,7}_ADJ')`  
- `)`  
+`-- ^ [a-z] starts with 4 to 7 alpha characters and has underscore for PoS`  
+AND (
+    REGEXP_CONTAINS(n.term, r'^[[\p{Ll}]{4,7}_NOUN') 
+    OR REGEXP_CONTAINS(n.term, r'^[\p{Ll}]{4,7}_VERB')
+    OR REGEXP_CONTAINS(n.term, r'^[[\p{Ll}]{4,7}_ADV')
+    OR REGEXP_CONTAINS(n.term, r'^[[\p{Ll}]{4,7}_ADJ')
 `ORDER BY`  
   `y.term_frequency DESC`  
 `LIMIT 50000;`  
@@ -369,3 +368,38 @@ This documentation assumes the input word CSV files already exist and follow the
 # 3\) wtool \- basic processing of loop artifacts.
 
 Combines words, removes duplicates; sorts by frequency
+
+# `extract_words.py` — Boolean Selector for Validated Wiktionary CSV
+
+`extract_words.py` is a **selection and filtering tool**, not a tokenizer.  
+It reads a **validated CSV** (typically produced by a Wiktionary validation step) and **selects word records** using:
+
+- **frequency bounds**
+- **exact word-length constraints**
+- a **boolean expression language** combining:
+  - **tags** (metadata attached to each word), and
+  - **word-pattern predicates** (glob-style, anchored, case-insensitive)
+
+The script streams its input, evaluates the selection logic per record, and emits only the matching words along with their frequency and tags.
+
+---
+
+## Overview
+
+Typical use cases include:
+
+- Building **answer lists** and **dictionary lists** for word games
+- Selecting words by **part of speech**, **quality flags**, or **source tags**
+- Excluding words by **spelling shape** (suffixes, length masks, etc.)
+- Rapid iteration on selection rules without changing code
+
+---
+
+## Command-line interface
+
+### Synopsis
+```bash
+python extract_words.py INPUT [-o OUT]
+                       [--fmin N] [--fmax N]
+                       [-l N ...]
+                       [-x EXPR]
