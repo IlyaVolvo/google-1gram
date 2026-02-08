@@ -428,9 +428,9 @@ def main() -> None:
 
             # Output: <word>\t<frequency>,<all tags>
             if all_tags_ordered:
-                fout.write(f"{word}\t{freq}," + ",".join(all_tags_ordered) + "\n")
+                fout.write(f"{word},{freq}," + ",".join(all_tags_ordered) + "\n")
             else:
-                fout.write(f"{word}\t{freq}\n")
+                fout.write(f"{word},{freq}\n")
 
             kept += 1
 

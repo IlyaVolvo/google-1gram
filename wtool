@@ -52,10 +52,13 @@ cmd_help() {
     die "unknown command: $c"
   fi
 }
+cmd_make_dictionary () {
+  sed 's/,/ /' input.csv ${1:-/dev/stdin}
+}
 
 cmd_clean() {
   root=$1
-  rm R*${root}.csv N*${root}.csv *-VALIDATED.csv *-REJECTED.csv
+  rm R*${root}.csv N*${root}.csv ${root}-VALIDATED.csv ${root}-VALIDATED.jsonl ${root}-REJECTED.csv
 }
 # combine validated_csv
 cmd_combine_valid() {
