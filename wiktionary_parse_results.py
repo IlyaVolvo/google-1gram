@@ -3,23 +3,24 @@
 wiktionary_parse_results.py
 
 Reads:
-  <base>-VALIDATED.jsonl  (or '-' for stdin)
+  <base>.jsonl  (or '-' for stdin)
 
 Writes:
-  <base>-VALIDATED.csv    (or stdout when input is '-')
+  <base>.csv    (or stdout when input is '-')
 
 CSV output:
   - One row per (word, part_of_speech)
   - Tags are emitted as *separate CSV columns* after the first 3 columns:
-      word,frequency,part_of_speech,<tag1>,<tag2>,...
+      word,frequency,part_of_speech,<tag1>,<tag2>,<tag3>,...
 
 Rules:
   - If a word has multiple PoS, emit multiple rows (one per PoS).
   - Do NOT add SINGULAR unless explicitly stated ("singular of"/"singular form of").
-  - Extra Russian handling:
-      * Emit NOMINATIVE_SINGULAR when definition explicitly contains "nominative singular of".
-      * Otherwise, emit NON_NOMINATIVE if any non-nominative case is explicitly mentioned.
-      * Do NOT emit specific case tags like GENITIVE, DATIVE, etc.
+  - Russian combined case+number tags (explicit-only):
+      * NOMINATIVE_SINGULAR
+      * NON_NOMINATIVE_SINGULAR
+      * NON_NOMINATIVE_PLURAL
+    (No separate NON_NOMINATIVE tag anymore.)
 
 Notes:
   - Single-threaded, pipeline-friendly.
@@ -295,12 +296,11 @@ def detect_russian_grammatical_tags(word: str, pos: str, entries: List[Dict[str,
     """
     Extract high-value Russian morphology tags from Wiktionary definition text.
 
-    Policy:
-      - Only tag what is explicitly stated.
-      - Case: emit ONLY:
-          * NOMINATIVE_SINGULAR when text contains "nominative singular of"
-          * otherwise NON_NOMINATIVE when any non-nominative case is explicitly mentioned
-        (do not emit GENITIVE/DATIVE/... or NOMINATIVE)
+    Case+Number combined tags (explicit-only):
+      - NOMINATIVE_SINGULAR if "nominative singular of" appears
+      - NON_NOMINATIVE_SINGULAR if any non-nominative case is mentioned AND singular is explicit
+      - NON_NOMINATIVE_PLURAL if any non-nominative case is mentioned AND plural is explicit
+      - Otherwise (no case mentioned): SINGULAR / PLURAL only if explicit
     """
     if not _is_cyrillic_word(word):
         return []
@@ -308,35 +308,31 @@ def detect_russian_grammatical_tags(word: str, pos: str, entries: List[Dict[str,
     tags: set[str] = set()
     defs = _definition_texts(entries)
 
-    # --- Case + Number: special base-form tag ---
-    saw_nom_sg = False
-    saw_singular = False
-    saw_plural = False
-    saw_nonnom = False
+    # --- Case + Number (combined) ---
+    saw_nom_sg = any("nominative singular of" in d for d in defs)
 
-    for d in defs:
-        if "nominative singular of" in d:
-            saw_nom_sg = True
+    saw_singular = any(("singular of" in d) or ("singular form of" in d) for d in defs)
+    saw_plural = any(("plural of" in d) or ("plural form of" in d) for d in defs)
 
-        if "singular of" in d or "singular form of" in d:
-            saw_singular = True
-        if "plural of" in d or "plural form of" in d:
-            saw_plural = True
-
-        # Any explicitly mentioned non-nominative case (paired with "of" phrasing)
-        if " of" in d and any(cw in d for cw in _NON_NOM_CASE_WORDS):
-            saw_nonnom = True
+    saw_nonnom = any((" of" in d) and any(cw in d for cw in _NON_NOM_CASE_WORDS) for d in defs)
 
     if saw_nom_sg:
-        # Atomic tag for "base form"
         tags.add("NOMINATIVE_SINGULAR")
     else:
-        if saw_singular:
-            tags.add("SINGULAR")
-        if saw_plural:
-            tags.add("PLURAL")
+        # If case explicitly non-nominative, emit combined tags when number is explicit.
         if saw_nonnom:
-            tags.add("NON_NOMINATIVE")
+            if saw_singular:
+                tags.add("NON_NOMINATIVE_SINGULAR")
+            if saw_plural:
+                tags.add("NON_NOMINATIVE_PLURAL")
+
+            # If case is mentioned but number isn't, emit nothing (explicit-only).
+        else:
+            # No case mentioned; keep plain number tags if explicit.
+            if saw_singular:
+                tags.add("SINGULAR")
+            if saw_plural:
+                tags.add("PLURAL")
 
     # --- Gender (explicit only; mostly NOUN/ADJ/VERB past forms) ---
     for g_word, g_tag in RUS_GENDER_TAGS.items():
@@ -374,7 +370,6 @@ def detect_russian_grammatical_tags(word: str, pos: str, entries: List[Dict[str,
         if any("imperative of" in d or "imperative form of" in d for d in defs):
             tags.update(["IMPERATIVE", "INFLECTED_FORM"])
 
-        # Participles (explicit phrases)
         if any("present active participle" in d for d in defs):
             tags.update(["PARTICIPLE", "PRES_PART", "INFLECTED_FORM"])
         if any("past active participle" in d for d in defs):
@@ -384,11 +379,9 @@ def detect_russian_grammatical_tags(word: str, pos: str, entries: List[Dict[str,
         if any("past passive participle" in d for d in defs):
             tags.update(["PARTICIPLE", "PAST_PASS_PART", "INFLECTED_FORM"])
 
-        # Russian adverbial participle / gerund
         if any("adverbial participle" in d or "gerund of" in d for d in defs):
             tags.update(["GERUND", "INFLECTED_FORM"])
 
-        # Aspect (explicit)
         if any("perfective of" in d or "perfective form of" in d for d in defs):
             tags.add("PERFECTIVE")
         if any("imperfective of" in d or "imperfective form of" in d for d in defs):
@@ -415,7 +408,6 @@ def group_by_pos(entries: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]
 def extract_tags(word: str, pos: str, entries: List[Dict[str, Any]]) -> List[str]:
     tags: set[str] = set()
 
-    # Existing
     if has_any_example(entries):
         tags.add("HAS_EXAMPLE")
 
@@ -442,7 +434,7 @@ def extract_tags(word: str, pos: str, entries: List[Dict[str, Any]]) -> List[str
         if num:
             tags.add(num)
 
-    # VERB inflection-ish (opt-in only via explicit phrases)
+    # VERB inflection-ish (generic; explicit-only phrases)
     if pos == "VERB":
         if contains("past participle"):
             tags.update(["PAST_PART", "INFLECTED_FORM"])
@@ -467,7 +459,7 @@ def extract_tags(word: str, pos: str, entries: List[Dict[str, Any]]) -> List[str
     tags.update(detect_morphology_tags(entries))
     tags.update(detect_foreign_script_tags(word, entries))
 
-    # Extra Russian grammar tags
+    # Russian combined grammar tags
     tags.update(detect_russian_grammatical_tags(word, pos, entries))
 
     return sorted(tags)
