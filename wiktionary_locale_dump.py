@@ -13,7 +13,8 @@ Outputs (file input mode):
 
 Outputs (stdin mode, input file "-"):
   - VALIDATED JSONL -> stdout
-  - NO artifact files
+  - (by default) NO artifact files
+  - If you set --out-base, artifacts are written using that base.
 
 PoS suffix behavior:
   - For querying / validated output word: strip trailing _<PoS> if present (years_NOUN -> years)
@@ -24,12 +25,17 @@ Flags:
   --cap        : try lowercase first; if it yields non-empty locale entries, also try capitalized and merge.
                 If either attempt hits a transient error/exception, send to RETRY.
   --workers N  : number of threads (default 4)
-  --debug      : verbose tracing to stderr (request URL, status, keys, classification)
+  --append     : append to output files instead of truncating (IMPORTANT for loop scripts)
+  --out-base   : override output base name (and enables artifacts even when input is "-")
+  --out-dir    : override output directory (default: same dir as input file)
+  --flush-every: flush output streams every N records (default 200)
+  --rps        : optional global rate limit requests per second (default 0 = off)
+  --debug      : verbose tracing to stderr
 
-Notes:
-  - HTML is stripped from definitions[].definition values, but structure is preserved.
-  - Safe URL encoding is always applied (avoids double-encoding).
-  - Exponential backoff for 429/5xx and network errors.
+Performance improvements vs your earlier version:
+  - thread-local requests.Session reuse (connection pooling)
+  - executor.map streaming (no 100k futures at once)
+  - optional append mode + periodic flush to avoid “empty files” during looped runs
 """
 
 from __future__ import annotations
@@ -41,18 +47,24 @@ import os
 import re
 import sys
 import time
+import threading
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
+from requests.adapters import HTTPAdapter
 
-USER_AGENT = "wordle-wiktionary-locale-dump/1.0 (https://example.invalid; contact: you@example.invalid)"
+
+USER_AGENT = "wordle-wiktionary-locale-dump/1.1 (https://example.invalid; contact: you@example.invalid)"
 
 DEFAULT_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "application/json; charset=utf-8",
 }
+
+BASE_URL = "https://en.wiktionary.org/api/rest_v1/page/definition/"
+_RETRYABLE = {429, 500, 502, 503, 504}
 
 # -------------------- CLI --------------------
 
@@ -60,19 +72,31 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(add_help=True)
     p.add_argument("lang", help="Locale key in REST JSON (e.g. en, de, fr, ru).")
     p.add_argument("file", help="Input CSV file (word,frequency) or '-' for stdin.")
-    p.add_argument("--max-validated",type=int,default=0,help="Stop early once this many words have been VALIDATED (0 = no limit).",)
-    p.add_argument("--cap", action="store_true", help="Try lowercase first, then capitalized; merge locale entries.")
-    p.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 16).")
-    p.add_argument("--debug", action="store_true", help="Enable verbose debug tracing to stderr.")
+    p.add_argument("--max-validated", type=int, default=0,
+                   help="Stop early once this many words have been VALIDATED (0 = no limit).")
+    p.add_argument("--cap", action="store_true",
+                   help="Try lowercase first, then capitalized; merge locale entries.")
+    p.add_argument("--workers", type=int, default=4,
+                   help="Number of parallel workers (default: 4).")
+    p.add_argument("--append", action="store_true",
+                   help="Append to output files instead of truncating (useful for loop scripts).")
+    p.add_argument("--out-base", default="",
+                   help="Override output base name. Also enables artifact files in stdin mode.")
+    p.add_argument("--out-dir", default="",
+                   help="Override output directory (default: same dir as input file).")
+    p.add_argument("--flush-every", type=int, default=200,
+                   help="Flush outputs every N processed records (default: 200). 0 disables.")
+    p.add_argument("--rps", type=float, default=0.0,
+                   help="Optional global request rate limit (requests per second). 0 disables.")
+    p.add_argument("--debug", action="store_true",
+                   help="Enable verbose debug tracing to stderr.")
     return p.parse_args()
-
 
 # -------------------- Debug --------------------
 
 def dbg(enabled: bool, msg: str) -> None:
     if enabled:
         print(f"[DEBUG] {msg}", file=sys.stderr)
-
 
 # -------------------- HTML stripping --------------------
 
@@ -88,7 +112,6 @@ class _HTMLStripper(HTMLParser):
     def get_text(self) -> str:
         return "".join(self._chunks)
 
-
 def strip_html(html: str) -> str:
     if not html:
         return ""
@@ -97,7 +120,6 @@ def strip_html(html: str) -> str:
     txt = s.get_text()
     txt = re.sub(r"\s+", " ", txt).strip()
     return txt
-
 
 # -------------------- URL encoding (safe, no double-encode) --------------------
 
@@ -119,7 +141,6 @@ def url_title(word: str) -> str:
                 return word
     return quote(word, safe="")
 
-
 # -------------------- PoS suffix stripping (ONLY for querying / validated output) --------------------
 
 _POS_SUFFIXES = {
@@ -135,16 +156,47 @@ def strip_pos_suffix_for_query(token: str) -> str:
         return base
     return token
 
+# -------------------- Thread-local Session (connection reuse) --------------------
+
+_tls = threading.local()
+
+def get_session() -> requests.Session:
+    s = getattr(_tls, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update(DEFAULT_HEADERS)
+        # Adapter with a bigger pool helps with thread reuse
+        adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _tls.session = s
+    return s
+
+# -------------------- Optional global rate limiting --------------------
+
+_rate_lock = threading.Lock()
+_next_time = 0.0
+
+def rate_limit(rps: float) -> None:
+    """Simple global pacing. rps=0 disables."""
+    global _next_time
+    if rps <= 0:
+        return
+    interval = 1.0 / rps
+    with _rate_lock:
+        now = time.time()
+        if now < _next_time:
+            time.sleep(_next_time - now)
+            now = time.time()
+        _next_time = now + interval
 
 # -------------------- REST fetching with backoff --------------------
-
-BASE_URL = "https://en.wiktionary.org/api/rest_v1/page/definition/"
-_RETRYABLE = {429, 500, 502, 503, 504}
 
 def fetch_definition(
     query_word: str,
     session: requests.Session,
     debug_enabled: bool,
+    rps: float,
     max_attempts: int = 6
 ) -> Tuple[int, Optional[Dict[str, Any]]]:
     """
@@ -153,17 +205,17 @@ def fetch_definition(
     404 is returned immediately (nonexistent).
     Other non-200 returns immediately with json None.
     """
-    # safe = url_title(query_word)
-    safe = quote(query_word, safe="")  # Hebrew -> %D7%...
-    url = BASE_URL + safe  # already encoded
+    safe = url_title(query_word)
+    url = BASE_URL + safe
 
     backoff = 0.5
     last_exc: Optional[str] = None
 
     for attempt in range(max_attempts):
         try:
+            rate_limit(rps)
             dbg(debug_enabled, f"REST GET {url} (attempt {attempt})")
-            r = session.get(url, timeout=20, headers=DEFAULT_HEADERS)
+            r = session.get(url, timeout=20)
             status = r.status_code
             dbg(debug_enabled, f"REST status {status} for word='{query_word}'")
 
@@ -171,12 +223,9 @@ def fetch_definition(
                 try:
                     data = r.json()
                     if isinstance(data, dict):
-                        dbg(debug_enabled, f"JSON top-level keys: {sorted(list(data.keys()))[:40]}")
-                    else:
-                        dbg(debug_enabled, f"JSON type: {type(data)}")
-                    return 200, data
+                        dbg(debug_enabled, f"JSON keys: {sorted(list(data.keys()))[:40]}")
+                    return 200, data if isinstance(data, dict) else None
                 except Exception as e:
-                    # JSON parse failure: treat as transient
                     last_exc = f"json parse error: {e}"
                     dbg(debug_enabled, f"JSON parse error; backoff {backoff:.2f}s; {last_exc}")
                     time.sleep(backoff)
@@ -192,7 +241,6 @@ def fetch_definition(
                 backoff = min(backoff * 2.0, 10.0)
                 continue
 
-            # Non-retryable status
             dbg(debug_enabled, f"Non-retryable status {status} -> RETRY bucket")
             return status, None
 
@@ -204,7 +252,6 @@ def fetch_definition(
 
     dbg(debug_enabled, f"Exhausted retries for word='{query_word}'. Last error: {last_exc or 'none'}")
     return 0, None
-
 
 def get_locale_entries(data: Optional[Dict[str, Any]], lang: str) -> List[Dict[str, Any]]:
     if not data or not isinstance(data, dict):
@@ -227,7 +274,6 @@ def strip_html_in_list(xs):
             out.append(x)
     return out
 
-
 def strip_html_in_parsed_examples(xs):
     """
     parsedExamples is usually: [{"example": "...html..."}, ...]
@@ -249,7 +295,6 @@ def strip_html_in_parsed_examples(xs):
             out.append(x)
     return out
 
-
 def strip_definitions(entries, debug_enabled: bool):
     cleaned = []
     for entry in entries:
@@ -265,15 +310,12 @@ def strip_definitions(entries, debug_enabled: bool):
 
                 d2 = dict(d)
 
-                # definition
                 if isinstance(d2.get("definition"), str):
                     d2["definition"] = strip_html(d2["definition"])
 
-                # examples (list[str])
                 if isinstance(d2.get("examples"), list):
                     d2["examples"] = strip_html_in_list(d2["examples"])
 
-                # parsedExamples (list[dict] with "example")
                 if isinstance(d2.get("parsedExamples"), list):
                     d2["parsedExamples"] = strip_html_in_parsed_examples(d2["parsedExamples"])
 
@@ -283,7 +325,6 @@ def strip_definitions(entries, debug_enabled: bool):
 
         cleaned.append(e2)
     return cleaned
-
 
 # -------------------- IO helpers --------------------
 
@@ -308,14 +349,11 @@ def parse_input_stream(fin) -> List[Tuple[str, int]]:
             tasks.append((w, f))
     return tasks
 
-
-def base_name_no_csv(path: str) -> Tuple[str, str]:
-    d = os.path.dirname(os.path.abspath(path))
+def base_name_no_csv(path: str) -> str:
     b = os.path.basename(path)
     if b.lower().endswith(".csv"):
         b = b[:-4]
-    return d, b
-
+    return b
 
 # -------------------- Outcomes --------------------
 
@@ -325,7 +363,6 @@ class Outcome:
     NONEXISTENT = "nonexistent"  # 404
     RETRY = "retry"              # any transient/non-200/non-404/0
 
-
 # -------------------- Core processing --------------------
 
 def process_one(
@@ -334,6 +371,7 @@ def process_one(
     lang: str,
     cap: bool,
     debug_enabled: bool,
+    rps: float,
 ) -> Tuple[str, str, str, int, List[Dict[str, Any]]]:
     """
     Returns (outcome, out_word, original_token, freq, entries)
@@ -341,11 +379,15 @@ def process_one(
       - original_token preserved for artifact CSVs
     """
     query_base = strip_pos_suffix_for_query(original_token)
-    session = requests.Session()
-    session.headers.update(DEFAULT_HEADERS)
+    session = get_session()
 
     def attempt(query_word: str) -> Tuple[int, List[Dict[str, Any]], bool]:
-        status, data = fetch_definition(query_word, session=session, debug_enabled=debug_enabled)
+        status, data = fetch_definition(
+            query_word,
+            session=session,
+            debug_enabled=debug_enabled,
+            rps=rps,
+        )
         if status == 200 and isinstance(data, dict):
             loc = get_locale_entries(data, lang)
             loc2 = strip_definitions(loc, debug_enabled)
@@ -404,7 +446,6 @@ def process_one(
         merged.extend(e2)
     return Outcome.VALIDATED, query_base, original_token, freq, merged
 
-
 # -------------------- Main --------------------
 
 def main() -> None:
@@ -417,28 +458,52 @@ def main() -> None:
     # Read tasks
     if args.file == "-":
         tasks = parse_input_stream(sys.stdin)
-        validated_out = sys.stdout
-        r_out = n_out = rej_out = None
-        out_paths = None
     else:
-        in_path = args.file
-        with open(in_path, "r", encoding="utf-8") as fin:
+        with open(args.file, "r", encoding="utf-8") as fin:
             tasks = parse_input_stream(fin)
 
-        d, base = base_name_no_csv(in_path)
-        validated_path = os.path.join(d, f"{base}-VALIDATED.jsonl")
-        r_path = os.path.join(d, f"R{base}.csv")
-        n_path = os.path.join(d, f"N{base}.csv")
-        rej_path = os.path.join(d, f"{base}-REJECTED.csv")
+    total = len(tasks)
 
-        validated_out = open(validated_path, "w", encoding="utf-8")
-        r_out = open(r_path, "w", encoding="utf-8")
-        n_out = open(n_path, "w", encoding="utf-8")
-        rej_out = open(rej_path, "w", encoding="utf-8")
+    # Decide output mode/paths
+    validated_out = sys.stdout
+    r_out = n_out = rej_out = None
+    out_paths = None
+
+    write_artifacts = (args.file != "-") or bool(args.out_base)
+
+    if write_artifacts:
+        if args.file != "-":
+            in_abs = os.path.abspath(args.file)
+            dflt_dir = os.path.dirname(in_abs)
+            base = base_name_no_csv(in_abs)
+        else:
+            # stdin mode, require out_base to name outputs
+            dflt_dir = os.getcwd()
+            base = args.out_base
+
+        out_dir = os.path.abspath(args.out_dir) if args.out_dir else dflt_dir
+        out_base = args.out_base if args.out_base else base
+
+        os.makedirs(out_dir, exist_ok=True)
+
+        validated_path = os.path.join(out_dir, f"{out_base}-VALIDATED.jsonl")
+        r_path = os.path.join(out_dir, f"R{out_base}.csv")
+        n_path = os.path.join(out_dir, f"N{out_base}.csv")
+        rej_path = os.path.join(out_dir, f"{out_base}-REJECTED.csv")
+
+        mode = "a" if args.append else "w"
+        # line-buffered to make files update while running
+        validated_out = open(validated_path, mode, encoding="utf-8", buffering=1)
+        r_out = open(r_path, mode, encoding="utf-8", buffering=1)
+        n_out = open(n_path, mode, encoding="utf-8", buffering=1)
+        rej_out = open(rej_path, mode, encoding="utf-8", buffering=1)
         out_paths = (validated_path, r_path, n_path, rej_path)
 
-    total = len(tasks)
-    print(f"Processing {total} words. lang={lang} cap={args.cap} workers={args.workers} debug={args.debug}", file=sys.stderr)
+    print(
+        f"Processing {total} words. lang={lang} cap={args.cap} "
+        f"workers={args.workers} debug={args.debug} append={args.append} rps={args.rps}",
+        file=sys.stderr
+    )
     if out_paths:
         vp, rp, np, rjp = out_paths
         print(f"Validated: {vp}", file=sys.stderr)
@@ -452,33 +517,19 @@ def main() -> None:
 
     def worker(t: Tuple[str, int]) -> Tuple[str, str, str, int, List[Dict[str, Any]]]:
         w, f = t
-        return process_one(w, f, lang=lang, cap=args.cap, debug_enabled=args.debug)
+        return process_one(w, f, lang=lang, cap=args.cap, debug_enabled=args.debug, rps=args.rps)
 
     try:
         with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-            futures = [ex.submit(worker, t) for t in tasks]
-
-            for fut in cf.as_completed(futures):
-                # If we already hit the limit, stop consuming results.
+            # Stream results; don’t create 100k futures at once.
+            for outcome, out_word, orig_token, freq, entries in ex.map(worker, tasks, chunksize=50):
                 if args.max_validated and validated >= args.max_validated:
-                    # Cancel anything not started yet
-                    for f in futures:
-                        f.cancel()
                     break
 
-                outcome, out_word, orig_token, freq, entries = fut.result()
                 processed += 1
                 lastw = orig_token
 
-                dbg(args.debug, f"CLASSIFY token='{orig_token}' -> outcome={outcome} out_word='{out_word}'")
-
                 if outcome == Outcome.VALIDATED:
-                    # If this one would exceed the limit, stop (don’t write it).
-                    if args.max_validated and validated >= args.max_validated:
-                        for f in futures:
-                            f.cancel()
-                        break
-
                     validated += 1
                     obj = {"word": out_word, "frequency": freq, "entries": entries}
                     validated_out.write(json.dumps(obj, ensure_ascii=False) + "\n")
@@ -493,16 +544,28 @@ def main() -> None:
                     if n_out is not None:
                         n_out.write(f"{orig_token},{freq}\n")
 
-                else:  # REJECTED
+                else:
                     rejected += 1
                     if rej_out is not None:
                         rej_out.write(f"{orig_token},{freq}\n")
+
+                # periodic flush so files are visible while running
+                if args.flush_every and processed % args.flush_every == 0:
+                    try:
+                        validated_out.flush()
+                    except Exception:
+                        pass
+                    for fh in (r_out, n_out, rej_out):
+                        try:
+                            if fh is not None:
+                                fh.flush()
+                        except Exception:
+                            pass
 
                 # progress report
                 if processed == total or (processed % 100 == 0 and processed > 0):
                     elapsed = time.time() - started
                     avg_ms = (elapsed * 1000.0 / processed) if processed else 0.0
-
                     print(
                         f"\rProcessed:{processed}/{total}  "
                         f"Validated:{validated}  Retry:{retry}  "
@@ -514,11 +577,23 @@ def main() -> None:
                         file=sys.stderr,
                     )
 
-
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
     finally:
-        if args.file != "-":
+        # final flush + close
+        try:
+            validated_out.flush()
+        except Exception:
+            pass
+        for fh in (r_out, n_out, rej_out):
+            try:
+                if fh is not None:
+                    fh.flush()
+            except Exception:
+                pass
+
+        # Close only if we opened files
+        if out_paths:
             try:
                 validated_out.close()
             except Exception:
@@ -533,7 +608,6 @@ def main() -> None:
     print("\nDone.", file=sys.stderr)
     if lastw:
         print(f"Last word processed: {lastw}", file=sys.stderr)
-
 
 if __name__ == "__main__":
     main()
