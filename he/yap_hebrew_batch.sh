@@ -7,8 +7,11 @@ CSV_FILE="${1}"
 BATCH_SIZE="${2:-100}"
 START_FROM="${3:-0}"
 DN="yap-hebrew"
-CONLL_TO_JSON="${4:-conll_to_json.sh}"
-OUTPUT_JSONL="${CSV_FILE%.csv}-yap.jsonl"
+OUTPUT_JSONL="${CSV_FILE%.csv}-yap-${START_FROM}.jsonl"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+CONLL_TO_JSON="${4:-$SCRIPT_DIR/conll_to_json.sh}"
 
 [[ ! -f "$CSV_FILE" ]] && { echo "ERROR: $CSV_FILE not found"; exit 1; }
 [[ "$BATCH_SIZE" -lt 1 ]] && { echo "ERROR: BATCH_SIZE >=1"; exit 1; }
