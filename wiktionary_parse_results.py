@@ -481,17 +481,16 @@ def main() -> None:
 
     if use_stdin:
         fin = sys.stdin
-        fout = sys.stdout
     else:
         if not os.path.exists(src):
             print(f"ERROR: input not found: {src}", file=sys.stderr)
             sys.exit(2)
         fin = open(src, "r", encoding="utf-8")
-        fout = open(replace_ext(src, ".csv"), "w", encoding="utf-8", newline="")
+
+    fout = sys.stdout
 
     try:
         w = csv.writer(fout)
-        w.writerow(["word", "frequency", "part_of_speech", "tags..."])
 
         for line_no, line in enumerate(fin, start=1):
             line = line.strip()

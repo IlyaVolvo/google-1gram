@@ -2,13 +2,10 @@
 """
 filter_by_tags.py
 
-Filter a tagged CSV (like the output of wiktionary_parse_results.py) using a boolean expression over tags
-AND (optionally) a regular expression match against the word.
+Filter a tagged CSV using a boolean expression over tags and (optionally) a regex match against the word.
 
 Input CSV format:
   word,frequency,part_of_speech,tag1,tag2,tag3,...
-
-Tags are separate CSV columns (not comma/semicolon lists).
 
 Usage:
   ./filter_by_tags.py input.csv 'PLURAL & NON_NOMINATIVE'
@@ -27,10 +24,8 @@ Expression language:
   - Parentheses: ( ... )
   - Whitespace ignored.
 
-Evaluation:
-  - The expression is evaluated against the tag set of each row.
-  - part_of_speech is also added to the tag set (e.g., NOUN/VERB/ADJ/ADV),
-    so you can filter like: 'NOUN & PLURAL'
+Special behavior:
+  - If <expr> is empty or only whitespace, it is treated as ALWAYS TRUE (pass-through).
 """
 
 from __future__ import annotations
@@ -42,11 +37,9 @@ import sys
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 
+import signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
-# Token types:
-#   - regex literal:  [ ... ]   (no nesting; ends at first ])
-#   - tag:            [A-Z0-9_]+
-#   - operators/parens: ( ) ! & |
 TOKEN_RE = re.compile(r"\s*(\[[^\]]+\]|[A-Z0-9_]+|[()!&|])\s*")
 
 
@@ -209,17 +202,7 @@ def eval_node(node: Node, tags: Set[str], word: str) -> bool:
 
 # -------------------- CSV handling --------------------
 
-def read_rows(fin) -> Tuple[List[str], List[List[str]]]:
-    r = csv.reader(fin)
-    header = next(r, None)
-    if header is None:
-        return [], []
-    rows = [row for row in r]
-    return header, rows
-
-
 def row_tagset(row: List[str]) -> Set[str]:
-    # Expected: word,frequency,part_of_speech,tag1,tag2,...
     tags: Set[str] = set()
     if len(row) >= 3:
         pos = (row[2] or "").strip().upper()
@@ -235,6 +218,7 @@ def row_tagset(row: List[str]) -> Set[str]:
 # -------------------- Main --------------------
 
 def main() -> None:
+    # expr parameter still required
     if len(sys.argv) != 3:
         print("Usage: filter_by_tags.py <input.csv | -> '<expr>'", file=sys.stderr)
         sys.exit(2)
@@ -242,11 +226,14 @@ def main() -> None:
     src = sys.argv[1]
     expr = sys.argv[2]
 
-    try:
-        ast = compile_expr(expr)
-    except ParseError as e:
-        print(f"ERROR: bad expression: {e}", file=sys.stderr)
-        sys.exit(2)
+    # Empty/whitespace expr => ALWAYS TRUE
+    ast: Optional[Node] = None
+    if expr.strip():
+        try:
+            ast = compile_expr(expr)
+        except ParseError as e:
+            print(f"ERROR: bad expression: {e}", file=sys.stderr)
+            sys.exit(2)
 
     if src == "-":
         fin = sys.stdin
@@ -268,6 +255,11 @@ def main() -> None:
         for row in reader:
             if not row:
                 continue
+
+            if ast is None:
+                writer.writerow(row)
+                continue
+
             word = (row[0] if len(row) >= 1 else "").strip()
             tags = row_tagset(row)
             if eval_node(ast, tags, word):
