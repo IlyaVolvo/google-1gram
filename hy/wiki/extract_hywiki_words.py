@@ -73,6 +73,8 @@ def strip_wikitext_best_effort(text: str, use_mwparser: bool) -> str:
     text = re.sub(r"\[https?://[^\s\]]+(?:\s+([^\]]+))?\]", r"\1", text)
     # Remove formatting quotes
     text = text.replace("'''", "").replace("''", "")
+    # Replace all occurrences of 'և' with 'եւ'.
+    text = text.replace("և", "եւ")
     return text
 
 def iter_text_nodes(xml_stream: io.BufferedReader) -> Iterable[str]:
