@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Design: Aram
+Coding: Perplexity
+Date: 2026-03-01
+
 Extract Armenian-only words (length 4..7) from hywiki XML dump (xml or xml.bz2),
 count frequencies, and optionally attach morphological analyses (morpheme splits)
 via an external analyzer command.
