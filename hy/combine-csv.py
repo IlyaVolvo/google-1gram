@@ -18,6 +18,7 @@ Major functionality:
   with count 1 in the output.
 - Output CSV to stdout with columns: word,count,tag,definition, with all words
   lowercased.
+- Skip duplicate words so each word appears at most once in the output.
 
 Command-line examples:
   ./combine_csv.py word-tags.csv word-count.csv > combined.csv
@@ -90,21 +91,24 @@ def main():
     writer.writeheader()
 
     recorded = 0
+    seen_words = set()  # track words already written
+
     for row in iter_tagged_records(input_files):
         word_raw = row["word"].strip()
         word = word_raw.lower()
+
+        # skip if this word is already recorded
+        if word in seen_words:
+            continue
+
         tag = row["tag"].strip()
         definition = row.get("definition", "")
 
-        # Filter by allowed tags
         if tag not in ALLOWED_TAGS:
             continue
-
-        # Filter by word length (4–9 characters)
         if not (4 <= len(word) <= 9):
             continue
 
-        # Base count from word-count.csv (0 if missing), then add 1
         base_count = counts.get(word_raw, 0)
         count = base_count + 1
 
@@ -115,6 +119,7 @@ def main():
             "definition": definition,
         })
 
+        seen_words.add(word)
         recorded += 1
         if recorded % 100 == 0:
            sys.stderr.write(f"\rRecorded {recorded} words...")
