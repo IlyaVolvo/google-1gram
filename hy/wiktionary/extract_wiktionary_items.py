@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Design: Aram
 Coding: Perplexity
@@ -6,170 +7,215 @@ Date: 2026-03-03
 
 extract_wiktionary_items wiktionary.xml
 
-Extract Armenian Wiktionary entries (word, POS tag, definition) from a dump
-and write them to CSV.
+Extract Armenian Wiktionary entries (word, POS tag, definition)
+from a Wiktionary XML dump and write them to CSV.
 
 Features:
-- Detect POS from Armenian POS templates inside the etymology (or whole text).
-- Map hy-Wiktionary POS templates to coarse POS tags (ADJ, ADV, NOUN, etc.).
+- Process only titles that are strings of Armenian letters; titles containing
+  non-Armenian characters are ignored and counted separately.
+- Ignore pages whose text contains '#REDIRECT' (case-insensitive) and report
+  how many were ignored for this reason.
+- Detect POS from Armenian POS templates anywhere inside the page <text>.
+- POS resolution priority:
+  * Collect all exact {{-hy-<x>-}} templates in the page.
+  * If any of those <x> values are keys in POS_MAP (loaded from pos-map.txt),
+    choose the first such template and use its tag for the whole page.
+  * If no such exact-match template exists:
+      - Look for any template matching {{*hy*<x>*}}:
+        · If <x> can be normalized to a POS_MAP key (-hy-<x>-), use its tag.
+        · Otherwise assign tag 'XXX-<x>'.
+      - If no {{*hy*<x>*}} template exists at all, tag the word 'XXX'.
+- POS_MAP is loaded at runtime from a text file pos-map.txt located next to
+  this script. Empty lines and lines starting with '#' are ignored.
+- Collect raw definition text as the concatenation of all lines in <text>
+  starting with '#', with bullets containing any skip word removed.
+- Build the final definition string using:
+    build_description(definition,
+                      count=None,
+                      filter_string=<--filter values>,
+                      trigger_second_bullet=<--desc-trigger values>)
+  from description_utils.py.
+  * Bullets containing any filter_string word (e.g. 'հնց') are dropped inside
+    description_utils before choosing the description bullet.
+  * If build_description returns an empty string, the entry is skipped.
 - Filter words by length using a normalized form where 'և' is replaced by 'եւ'.
-- Optionally skip words listed in a plain text file (comma-separated list):
-  * Titles matching any skip word are excluded entirely.
-  * Definition bullet items (lines starting with '#') that contain any skip
-    word are removed from the output definition string.
-- Optionally filter out records using --filter:
-  * --filter takes a comma-separated list of words.
-  * If any of these words occurs as a whole word in the final definition
-    string of an entry, that entire entry is skipped.
-- Show progress as the number of records written.
-
-Examples:
-  # Default length range 4–9, write to stdout
-  ./extract_wiktionary_items wiktionary.xml > out.csv
-
-  # Limit to words of normalized length 5–8
-  ./extract_wiktionary_items --min 5 --max 8 wiktionary.xml > out.csv
-
-  # Skip words listed in skip.txt (e.g. "արագ,զուգահեռաջիղ")
-  ./extract_wiktionary_items --skip skip.txt wiktionary.xml > out.csv
-
-  # Filter out entries whose definitions contain whole words "գիրք" or "տուն"
-  ./extract_wiktionary_items --filter "գիրք,տուն" wiktionary.xml > out.csv
+- Skip/skip-file handling:
+  * A skip file (comma-separated words) excludes titles whose word is in the file.
+  * Definition bullet items (lines starting with '#') that contain any skip word
+    are removed from that word's raw definition before build_description.
+- Skipped/filtered output:
+  * All skipped/filtered entries are written into filtered-extract.csv.
+  * Columns: word, tag, filter, definition.
+  * The "filter" column is 'skipped' (for skip-file, length, no defs, or empty description).
+- Progress reporting:
+  * Progress is shown as the number of input words (<title> elements) processed.
+  * At the end, the script prints:
+    - total titles processed,
+    - extracted entries,
+    - skipped/filtered entries,
+    - titles with non-Armenian characters,
+    - titles ignored because of redirects.
 """
 
 import sys
 import re
 import csv
 import argparse
+import os
 import xml.etree.ElementTree as ET
 
-# Exact POS mapping from your specification
-POS_MAP = {
-    "{{-hy-ած-}}": "ADJ",
-    "{{-hy-մակ-}}": "ADV",
-    "{{-hy-գո-}}": "NOUN",
-    "{{-hy-բայ-}}": "VERB",
-    "{{-hy-դեր-}}": "PRON",
-    "{{-hy-թվ-}}": "NUM",
-    "{{-hy-կապ-}}": "ADP",
-    "{{-hy-շաղ-}}": "CONJ",
-    "{{-hy-ձա-}}": "INTJ",
-    "{{-hy-եղբ-}}": "MOD",
-}
+# Import build_description from parent folder
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+sys.path.insert(0, PARENT_DIR)
+from description_utils import build_description  # type: ignore
 
-ETYM_HEADER_RE = re.compile(r"^==\s*Ստուգաբանություն\s*==\s*$", re.MULTILINE)
-H2_HEADER_RE = re.compile(r"^==\s*[^=]+==\s*$", re.MULTILINE)
-POS_TPL_RE = re.compile(r"(\{\{-hy-[^}]+\}\})")
-DEF_RE = re.compile(r"^#\s*.+")  # keep leading '# '
+
+def load_pos_map(pos_map_path: str) -> dict:
+    """
+    Load POS mapping from a text file.
+
+    Expected format (one mapping per line):
+        -hy-ած-  ADJ
+        -hy-գո-  NOUN
+
+    Lines starting with '#' or empty lines are ignored.
+    The first token is the key, the last token on the line is the tag.
+    """
+    pos_map: dict[str, str] = {}
+    try:
+        with open(pos_map_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                key = parts[0].strip()
+                tag = parts[-1].strip()
+                if key and tag:
+                    pos_map[key] = tag
+    except OSError as e:
+        sys.stderr.write(
+            f"Warning: could not read POS map file '{pos_map_path}': {e}\n"
+        )
+    return pos_map
+
+
+# This will be set in main()
+POS_MAP: dict[str, str] = {}
+
+POS_TPL_EXACT_RE = re.compile(r"\{\{(-hy-[^}]+)\}\}")
+POS_TPL_LOOSE_RE = re.compile(r"\{\{[^}]*hy(?P<x>[^}|]*)[^}]*\}\}")
+DEF_RE = re.compile(r"^#\s*.+")
+ARMENIAN_TITLE_RE = re.compile(r"^[\u0531-\u0556\u0561-\u0587]+$")
+REDIRECT_RE = re.compile(r"#REDIRECT", re.IGNORECASE)
 
 
 def normalize_for_length(word: str) -> str:
-    """Replace 'և' with 'եւ' before measuring length."""
     return word.replace("և", "եւ")
 
 
-def get_relevant_section(text):
-    """Return POS/definition region; prefer '== Ստուգաբանություն ==' if present."""
-    m_ety = ETYM_HEADER_RE.search(text)
-    if not m_ety:
-        return text
-    start_idx = m_ety.end()
-    rest = text[start_idx:]
-    m_next = H2_HEADER_RE.search(rest)
-    if m_next:
-        return rest[:m_next.start()]
-    return rest
+def is_armenian_title(title: str) -> bool:
+    if not title:
+        return False
+    return ARMENIAN_TITLE_RE.match(title) is not None
+
+
+def resolve_pos_tag_whole_text(text: str) -> str:
+    """Resolve POS tag using templates in the full text and POS_MAP."""
+    # 1) exact {{-hy-<x>-}} templates
+    exact_matches = POS_TPL_EXACT_RE.findall(text)
+    if exact_matches:
+        for key in exact_matches:
+            if key in POS_MAP:
+                return POS_MAP[key]
+    # 2) loose {{*hy*<x>*}} templates
+    loose_matches = list(POS_TPL_LOOSE_RE.finditer(text))
+    if loose_matches:
+        m = loose_matches[0]
+        x = (m.group("x") or "").strip()
+        key_candidate = f"-hy-{x}-" if x else ""
+        if key_candidate in POS_MAP:
+            return POS_MAP[key_candidate]
+        if x:
+            return f"XXX-{x}"
+        return "XXX"
+    # 3) no hy templates at all
+    return "XXX"
+
+
+def extract_definition_from_text(text: str, skip_set):
+    """
+    Any line starting with '#' is considered a definition bullet.
+    Bullets containing any skip word are removed.
+    """
+    defs = []
+    for line in text.splitlines():
+        line = line.rstrip()
+        if DEF_RE.match(line):
+            if any(sw in line for sw in skip_set):
+                continue
+            defs.append(line)
+    if not defs:
+        return ""
+    return " ".join(defs)
 
 
 def extract_from_page(title_el, text_el, skip_set):
+    """
+    Extract (word, tag, raw_definition) for a single <page> element.
+    """
     if title_el is None or text_el is None or not text_el.text:
-        return []
+        return "NODEFS", None
 
     word = (title_el.text or "").strip()
     text = text_el.text
-    section = get_relevant_section(text)
 
-    pos_hits = []
-    for m in POS_TPL_RE.finditer(section):
-        tpl = m.group(1)
-        if tpl in POS_MAP:
-            pos_hits.append((m.start(), m.end(), tpl))
+    if REDIRECT_RE.search(text):
+        return "REDIRECT", None
 
-    if not pos_hits:
-        return []
+    tag = resolve_pos_tag_whole_text(text)
+    definition_str = extract_definition_from_text(text, skip_set)
+    if not definition_str:
+        return "NODEFS", None
 
-    records = []
-    for i, (start, end, tpl) in enumerate(pos_hits):
-        block_start = end
-        block_end = pos_hits[i + 1][0] if i + 1 < len(pos_hits) else len(section)
-        block = section[block_start:block_end]
-
-        defs = []
-        for line in block.splitlines():
-            line = line.rstrip()
-            if DEF_RE.match(line):
-                # Remove bullet if any skip word appears in it
-                if any(sw in line for sw in skip_set):
-                    continue
-                defs.append(line)
-
-        if not defs:
-            continue
-
-        definition_str = " ".join(defs)
-        tag = POS_MAP[tpl]
-        records.append((word, tag, definition_str))
-
-    return records
+    return "OK", (word, tag, definition_str)
 
 
-def extract_wiktionary_items(xml_path, skip_set):
+def iter_pages(xml_path):
     tree = ET.parse(xml_path)
     root = tree.getroot()
-
     m = re.match(r"\{.*\}", root.tag)
     ns = m.group(0) if m else ""
     page_tag = ns + "page"
     title_tag = ns + "title"
     text_tag = ns + "text"
 
+    title_count = 0
     for page in root.iter(page_tag):
         title_el = page.find("./" + title_tag)
         text_el = page.find(".//" + text_tag)
-        for rec in extract_from_page(title_el, text_el, skip_set):
-            yield rec
+        title_count += 1
+        yield title_count, title_el, text_el
 
 
 def load_skip_file(path: str):
-    """
-    Load a comma-separated list of words from a text file into a set.
-    All commas across the file are treated as separators.
-    """
+    if not path:
+        return set()
     try:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-    except OSError:
-        sys.stderr.write(f"Warning: could not read skip file '{path}', ignoring.\n")
+    except OSError as e:
+        sys.stderr.write(f"Warning: could not read skip file '{path}': {e}\n")
         return set()
-
     skip_set = set()
     for w in content.split(","):
         w = w.strip()
         if w:
             skip_set.add(w)
     return skip_set
-
-
-def parse_filter_words(filter_arg: str):
-    """Parse comma-separated filter words into a list and compile regex for whole-word matching."""
-    if not filter_arg.strip():
-        return [], None
-    words = [w.strip() for w in filter_arg.split(",") if w.strip()]
-    if not words:
-        return [], None
-    # Whole "word" in this context: use \b; should work reasonably with Armenian letters.
-    pattern = r"\b(" + "|".join(re.escape(w) for w in words) + r")\b"
-    return words, re.compile(pattern)
 
 
 def parse_args():
@@ -191,8 +237,18 @@ def parse_args():
         type=str,
         default="",
         help=(
-            "Comma-separated list of words. If any of these occurs as a whole "
-            "word in the definition of an entry, that entry is skipped."
+            "Comma-separated list of words; passed as filter_string to "
+            "build_description so bullets containing them are dropped."
+        ),
+    )
+    p.add_argument(
+        "--desc-trigger",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated trigger words for choosing the second bullet when "
+            "building description; passed as trigger_second_bullet to "
+            "build_description."
         ),
     )
     p.add_argument("xml_path", help="Path to Armenian Wiktionary XML dump.")
@@ -200,43 +256,97 @@ def parse_args():
 
 
 def main():
+    global POS_MAP
+
     args = parse_args()
 
-    # Build skip set from file, if provided
-    skip_set = set()
-    if args.skip.strip():
-        skip_set = load_skip_file(args.skip.strip())
+    # Load POS_MAP from pos-map.txt in the same directory as this script
+    pos_map_path = os.path.join(SCRIPT_DIR, "pos-map.txt")
+    POS_MAP = load_pos_map(pos_map_path)
 
-    # Build filter word list and regex
-    filter_words, filter_re = parse_filter_words(args.filter)
+    skip_set = load_skip_file(args.skip.strip()) if args.skip.strip() else set()
 
-    writer = csv.writer(sys.stdout)
-    writer.writerow(["word", "tag", "definition"])
+    out_writer = csv.writer(sys.stdout)
+    out_writer.writerow(["word", "tag", "definition"])
 
-    count = 0
-    for word, tag, definition in extract_wiktionary_items(args.xml_path, skip_set):
-        # Skip titles that are in skip list
-        if word in skip_set:
-            continue
+    filtered_path = "filtered-extract.csv"
+    filtered_file = open(filtered_path, "w", encoding="utf-8", newline="")
+    filtered_writer = csv.writer(filtered_file)
+    filtered_writer.writerow(["word", "tag", "filter", "definition"])
 
-        # Length filter
-        norm_word = normalize_for_length(word)
-        if not (args.min <= len(norm_word) <= args.max):
-            continue
+    total_titles = 0
+    extracted_count = 0
+    filtered_count = 0
+    non_armenian_titles = 0
+    redirect_titles = 0
 
-        # Definition filter by whole filter-words
-        if filter_re is not None and filter_re.search(definition):
-            continue
+    for title_idx, title_el, text_el in iter_pages(args.xml_path):
+        total_titles = title_idx
 
-        writer.writerow([word, tag, definition])
-        count += 1
-
-        if count % 100 == 0:
-            sys.stderr.write(f"\rRecorded {count} words...")
+        if total_titles % 100 == 0:
+            sys.stderr.write(f"\rProcessed titles: {total_titles}")
             sys.stderr.flush()
 
-    sys.stderr.write(f"\rRecorded {count} words.\n")
+        if title_el is None:
+            continue
+
+        word = (title_el.text or "").strip()
+
+        # Armenian-only titles
+        if not is_armenian_title(word):
+            non_armenian_titles += 1
+            continue
+
+        # Skip-file titles
+        if word in skip_set:
+            filtered_writer.writerow([word, "", "skipped", ""])
+            filtered_count += 1
+            continue
+
+        status, payload = extract_from_page(title_el, text_el, skip_set)
+
+        if status == "REDIRECT":
+            redirect_titles += 1
+            continue
+
+        if status == "NODEFS" or payload is None:
+            filtered_writer.writerow([word, "", "skipped", ""])
+            filtered_count += 1
+            continue
+
+        word_rec, tag, raw_definition = payload
+
+        # Length filter
+        norm_word = normalize_for_length(word_rec)
+        if not (args.min <= len(norm_word) <= args.max):
+            filtered_writer.writerow([word_rec, tag, "skipped", raw_definition])
+            filtered_count += 1
+            continue
+
+        # Build final definition via description_utils; no count/frequency here
+        final_def = build_description(
+            raw_definition,
+            count=None,
+            filter_string=args.filter if args.filter.strip() else None,
+            trigger_second_bullet=args.desc_trigger if args.desc_trigger.strip() else None,
+        )
+
+        # Skip entry if build_description returns empty
+        if not final_def:
+            filtered_writer.writerow([word_rec, tag, "skipped", raw_definition])
+            filtered_count += 1
+            continue
+
+        out_writer.writerow([word_rec, tag, final_def])
+        extracted_count += 1
+
+    sys.stderr.write(f"\rProcessed titles: {total_titles}\n")
+    sys.stderr.write(f"Extracted entries: {extracted_count}\n")
+    sys.stderr.write(f"Skipped/filtered entries: {filtered_count}\n")
+    sys.stderr.write(f"Titles with non-Armenian characters: {non_armenian_titles}\n")
+    sys.stderr.write(f"Titles ignored because of redirects: {redirect_titles}\n")
     sys.stderr.flush()
+    filtered_file.close()
 
 
 if __name__ == "__main__":

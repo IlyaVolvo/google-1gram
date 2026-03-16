@@ -1,0 +1,12 @@
+-hy-ած-  ADJ
+-hy-մակ-  ADV
+-hy-գո-   NOUN
+-hy-բայ-  VERB
+-hy-դեր-  PRON
+-hy-թվ-   NUM
+-hy-կապ-  ADP
+-hy-շաղ-  CONJ
+-hy-ձա-   INTJ
+-hy-եղբ-  MOD
+-hy-հատ-  PLC
+-hy-հպվ-  ABBR
