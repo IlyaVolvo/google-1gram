@@ -1,0 +1,13 @@
+# POS weights for --single=y
+NOUN 12
+ADJ 11
+VERB 10
+ADV 9
+PRON 8
+NUM 7
+ADP 6
+CONJ 5
+MOD 4
+INTJ 3
+ABBR 2
+PLC 1
