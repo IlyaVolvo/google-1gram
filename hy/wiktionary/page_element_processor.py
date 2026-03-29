@@ -16,6 +16,7 @@ Wiktionary XML dump, using the refactored, modular pipeline:
     column values ('skipped', 'REDIRECT', 'no tag', unmapped POS key, 'no desc').
 """
 
+import debug_utils
 import sys
 import re
 import csv
@@ -23,7 +24,6 @@ import argparse
 import os
 import xml.etree.ElementTree as ET
 from typing import Dict
-
 import text_pre_processors as tpp
 import text_processor as tp
 import description_processor as dp
@@ -133,6 +133,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Extract Armenian Wiktionary items (word, POS, definition) to CSV."
     )
+
     p.add_argument("--min", type=int, default=4,
                    help="Minimum normalized word length (default: 4).")
     p.add_argument("--max", type=int, default=9,
@@ -141,19 +142,19 @@ def parse_args():
         "--skip",
         type=str,
         default="",
-        help="Path to text file with comma-separated words to skip."
+        help="Path to text file with comma-separated words to skip.",
     )
     p.add_argument(
         "--filter",
         type=str,
         default="",
-        help="Comma-separated values passed as filter_string to description_processor."
+        help="Comma-separated values passed as filter_string to description_processor.",
     )
     p.add_argument(
         "--desc-trigger",
         type=str,
         default="",
-        help="Comma-separated values passed as trigger_second_bullet to description_processor."
+        help="Comma-separated values passed as trigger_second_bullet to description_processor.",
     )
     p.add_argument(
         "--single",
@@ -168,15 +169,24 @@ def parse_args():
         default="",
         help="Comma-separated list of pre-processors to disable (e.g. 'pp1,pp3').",
     )
+    # NEW: debug flag
+    p.add_argument(
+        "--debug",
+        type=str,
+        default="",
+        help="enable debug logging to debug.txt (any non-empty word)",
+    )
+
     p.add_argument("xml_path", help="Path to Armenian Wiktionary XML dump.")
     return p.parse_args()
-
 
 def main():
     global POS_MAP, POS_WEIGHTS
 
     args = parse_args()
     single_mode = (args.single.lower() == "y")
+
+    debug_target = normalize_title(args.debug).strip() if args.debug else ""
 
     pos_map_path = os.path.join(SCRIPT_DIR, "pos-map.txt")
     POS_MAP = load_pos_map(pos_map_path)
@@ -224,6 +234,11 @@ def main():
         if not is_armenian_title(title):
             non_armenian_titles += 1
             continue
+
+        if debug_target and title == debug_target:
+            debug_utils.DEBUG_WORD = title
+        else:
+            debug_utils.DEBUG_WORD = ""
 
         if title in skip_set:
             filtered_writer.writerow([title, "", "skipped", ""])

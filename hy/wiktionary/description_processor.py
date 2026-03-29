@@ -3,54 +3,68 @@
 """
 Design: Aram
 Coding: Perplexity
-Date: 2026-03-11
+Date: 2026-03-13
 
 description_processor.py
 
 Builds final dictionary entry descriptions from POS description regions
-extracted from a Wiktionary <text> element.
+extracted from a Wiktionary element.
 
 Public interface:
-    process_description(text: str) -> str
+process_description(text: str) -> str
 
 Expected input:
-    'text' is the raw POS description region (string) for a single POS
-    section. It may contain one or more bullet items starting with '#', or
-    plain lines that have already been normalized into bullets by pre-
-    processing (pp2).
+'text' is the raw POS description region (string) for a single POS
+section. Pre-processors (pp1/pp2/pp3) have already:
+- normalized etymology placement,
+- ensured that POS description bullets use '# ' when appropriate,
+- handled -hy-բաց- structural issues.
 
 Behavior:
-  - Interpret bullet items as segments starting with '#'.
-  - Optionally drop bullets containing any of the --filter terms.
-  - Clean each bullet:
-      * remove leading '#';
-      * remove nested '{{...}}';
-      * remove 'տե՛ս';
-      * replace '[[foo]]' with 'foo';
-      * trim whitespace.
-  - Skip bullets whose cleaned text is empty.
-  - Choose a cleaned bullet as description:
-      * if there is only one candidate: use it;
-      * if there are at least two candidates and any of the--desc-trigger
-        words occurs in the first RAW bullet, use the cleaned text of the
-        second candidate; otherwise use the cleaned text of the first.
-  - If no cleaned candidate bullet remains, return "".
-  - If USE_COUNT is True and COUNT_VALUE is non-zero, prefix the result
-    with 'fr=<COUNT_VALUE>; '. In this script, count-related globals can
-    be left unused; page_element_processor sets USE_COUNT=False by default.
+- Process the POS region line by line.
+- Bullet-items are lines whose first non-space character is '#'.
+- FILTER_STRING (CSV) and DESC_TRIGGER (CSV) are applied to
+  **cleaned** bullet lines using whole-word matching:
+  * Cleaning: remove leading '#', remove '{{...}}', replace '[[foo]]'
+    with 'foo', strip whitespace.
+  * Lines whose cleaned text is empty are discarded before filtering.
+  * Tokenization: split the cleaned line on whitespace and LATIN
+    punctuation characters. Only exact token matches count.
+  * FILTER_STRING: drop any bullet-item whose cleaned text has at least
+    one token equal to any filter word.
+  * DESC_TRIGGER: iterate the remaining bullet-items in order and
+    drop each bullet-item that has any token equal to a trigger
+    word, until you reach (1) a bullet-item with no trigger word,
+    or (2) the last bullet-item. The first bullet-item that
+    survives this process (or the last one, if all contain a
+    trigger word) is selected.
+- The selected bullet-item's cleaned text is returned.
+- If USE_COUNT is False, return just the cleaned bullet text.
+- If USE_COUNT is True:
+  * Normalize COUNT_VALUE (string or int).
+  * If COUNT_VALUE is empty/zero, return "fr=; ".
+  * Otherwise, return "fr=<COUNT_VALUE>; <cleaned text>".
 """
 
 import re
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union, Tuple
 
-# Globals configured by page_element_processor
-FILTER_STRING: Optional[str] = None
-DESC_TRIGGER: Optional[str] = None
+import debug_utils
+
+# Globals configured by page_element_processor at runtime.
+FILTER_STRING: Optional[str] = None  # e.g. "սերթ,քայլ" or None
+DESC_TRIGGER: Optional[str] = None   # e.g. "ունտու" or CSV list
 USE_COUNT: bool = False
 COUNT_VALUE: Optional[Union[str, int]] = None
 
-ARMENIAN_LETTER_RE = re.compile(r"[\u0531-\u0556\u0561-\u0587]")
+# Latin punctuation for tokenization (Armenian and other letters are
+# left intact as part of tokens).
+WORD_SPLIT_RE = re.compile(
+    r"[ \t\r\n\f\v!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~]+"
+)
 
+# Simple Armenian-range check for sanity (for optional future use).
+ARMENIAN_RE = re.compile(r"[\u0531-\u058F]")
 
 # ---------------------------------------------------------------------------
 # Low-level cleaning
@@ -62,7 +76,7 @@ def remove_nested_double_braces(text: str) -> str:
     Remove all segments enclosed in nested '{{...}}' pairs.
 
     Example:
-        'foo {{bar {{baz}} qux}} zip' -> 'foo  zip'
+    'foo {{bar {{baz}} qux}} zip' -> 'foo zip'
     """
     result: List[str] = []
     depth = 0
@@ -86,49 +100,41 @@ def remove_nested_double_braces(text: str) -> str:
     return "".join(result)
 
 
-def split_bullets(definition: str) -> List[str]:
+def clean_bullet_text(line: str) -> str:
     """
-    Split definition text into bullet segments starting with '#'.
+    Clean a single bullet-item line:
 
-    If no '#' is present, treat the entire definition as a single pseudo-bullet.
+    - Remove the leading '#' (after any indentation).
+    - Remove nested '{{...}}'.
+    - Replace '[[foo]]' with 'foo'.
+    - Strip surrounding whitespace.
     """
-    if not definition:
-        return []
-
-    positions = [i for i, ch in enumerate(definition) if ch == "#"]
-    if not positions:
-        return [definition]
-
-    bullets: List[str] = []
-    for idx, start in enumerate(positions):
-        end = positions[idx + 1] if idx + 1 < len(positions) else len(definition)
-        bullets.append(definition[start:end])
-    return bullets
-
-
-def clean_bullet_text(bullet: str) -> str:
-    """
-    Clean a single bullet string:
-      - Remove leading '#'.
-      - Remove nested '{{...}}'.
-      - Remove 'տե՛ս'.
-      - Replace '[[foo]]' with 'foo'.
-      - Strip whitespace.
-    """
-    if not bullet:
+    if not line:
         return ""
 
-    if bullet.startswith("#"):
-        bullet = bullet[1:]
+    stripped = line.lstrip()
+    if not stripped.startswith("#"):
+        return ""
+
+    # Remove the leading '#' from the stripped line
+    bullet = stripped[1:]
 
     bullet = remove_nested_double_braces(bullet)
-    bullet = bullet.replace("տե՛ս", "")
-    bullet = re.sub(r"\[\[([^|\]]+)\]\]", r"\1", bullet)
+
+    # Replace '[[foo]]' and '[[foo|bar]]' with visible text
+    def _link_repl(m: re.Match) -> str:
+        target = m.group(1)
+        label = m.group(2)
+        return label or target
+
+    bullet = re.sub(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", _link_repl, bullet)
+
+    bullet = bullet.strip(" \t\r\n,;:()[]")
     return bullet.strip()
 
 
 # ---------------------------------------------------------------------------
-# High-level selection
+# Helpers for FILTER_STRING and DESC_TRIGGER
 # ---------------------------------------------------------------------------
 
 
@@ -139,114 +145,194 @@ def parse_csv_values(value: Optional[str]) -> List[str]:
     return [x.strip() for x in value.split(",") if x.strip()]
 
 
-def filter_bullets(bullets: List[str], filter_words: List[str]) -> List[str]:
+def tokenize_words(line: str) -> List[str]:
     """
-    Drop bullets that contain any of the filter_words as substrings.
+    Tokenize a line into 'whole words' by splitting on whitespace and
+    LATIN punctuation characters. This keeps Armenian and other script
+    letters intact inside tokens.
 
-    Matching is case-sensitive and uses simple substring search.
+    Example:
+    '[[հինգ]]ից' -> ['[[հինգ]]ից']
     """
-    if not bullets:
+    if not line:
         return []
-    if not filter_words:
-        return bullets
-
-    kept: List[str] = []
-    for b in bullets:
-        if any(w in b for w in filter_words):
-            continue
-        kept.append(b)
-    return kept
+    tokens = WORD_SPLIT_RE.split(line)
+    return [t for t in tokens if t]
 
 
-def collect_candidates(definition: str) -> List[Tuple[str, str]]:
+def line_contains_any_word(line: str, words: List[str]) -> bool:
     """
-    Convert raw definition text into candidate (raw, cleaned) bullet pairs:
-
-      1. Split into raw bullets.
-      2. Apply FILTER_STRING (drop bullets containing filter words).
-      3. Clean each remaining bullet.
-      4. Keep only bullets whose cleaned text is non-empty.
-
-    Returns:
-        List[(raw_bullet, cleaned_bullet)].
+    Return True if any of the given words matches a **whole token** in
+    the line, after tokenization by WORD_SPLIT_RE.
     """
-    bullets = split_bullets(definition)
-    if not bullets:
-        return []
+    if not words or not line:
+        return False
 
-    fw = parse_csv_values(FILTER_STRING)
-    bullets = filter_bullets(bullets, fw)
+    tokens = tokenize_words(line)
+    if not tokens:
+        return False
 
+    token_set = set(tokens)
+    return any(w in token_set for w in words)
+
+
+def collect_bullet_lines(text: str) -> List[str]:
+    """
+    Collect bullet-item lines from the POS region.
+
+    A bullet-item is any line whose first non-space character is '#'.
+    Empty lines and non-bullet lines are ignored.
+    """
+    lines = text.splitlines()
+    bullets: List[str] = []
+    for line in lines:
+        debug_utils._debug_log("description_processor: line", line)
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            bullets.append(line)
+    debug_utils._debug_log(
+        "description_processor: bullet_lines", "\n".join(bullets)
+    )
+    return bullets
+
+
+# NEW: clean all bullets first, discard those that become empty
+def build_cleaned_candidates(
+    bullet_lines: List[str],
+) -> List[Tuple[str, str]]:
+    """
+    From raw bullet lines, build a list of (raw_line, cleaned_text)
+    pairs, discarding bullets whose cleaned_text is empty.
+
+    This enforces the spec that bullet-items becoming empty after
+    template processing are removed before filtering.
+    """
     candidates: List[Tuple[str, str]] = []
-    for b in bullets:
-        cleaned = clean_bullet_text(b)
-        if cleaned:
-            candidates.append((b, cleaned))
+    for raw in bullet_lines:
+        cleaned = clean_bullet_text(raw)
+        debug_utils._debug_log(
+            "description_processor: cleaned_candidate",
+            f"{raw}\n--> {cleaned}",
+        )
+        if not cleaned:
+            continue
+        candidates.append((raw, cleaned))
     return candidates
 
 
-def choose_cleaned_bullet(definition: str) -> str:
+def select_bullet_line(
+    candidates: List[Tuple[str, str]]
+) -> Optional[Tuple[str, str]]:
     """
-    Choose a cleaned bullet according to trigger rules:
+    Apply FILTER_STRING and DESC_TRIGGER logic to choose a bullet line,
+    using whole-word matching on the **cleaned** text.
 
-      - Build a list of (raw, cleaned) candidates with non-empty cleaned text.
-      - If none, return "".
-      - If only one candidate, return its cleaned text.
-      - If there are at least two candidates and any DESC_TRIGGER word occurs
-        in the first raw bullet, return the cleaned text of the second
-        candidate; otherwise return the cleaned text of the first.
+    candidates: list of (raw_line, cleaned_text) pairs.
+
+    FILTER_STRING:
+    Drop any candidate where the cleaned_text has at least one filter
+    word equal to a token.
+
+    DESC_TRIGGER:
+    Let T be the list of trigger words.
+    Iterate through the remaining candidates in order:
+    - If a candidate has any token equal to a trigger word and it is
+      not the last candidate, drop it and continue.
+    - Otherwise (no trigger word in its tokens, or last candidate),
+      select this candidate and stop.
+    If all candidates contain trigger words, the last one is selected.
     """
-    candidates = collect_candidates(definition)
     if not candidates:
+        return None
+
+    filter_words = parse_csv_values(FILTER_STRING)
+    trigger_words = parse_csv_values(DESC_TRIGGER)
+
+    # Apply FILTER_STRING on cleaned text
+    filtered: List[Tuple[str, str]] = []
+    for raw, cleaned in candidates:
+        debug_utils._debug_log("description_processor: filter", raw)
+        if line_contains_any_word(cleaned, filter_words):
+            continue
+        debug_utils._debug_log("description_processor: append", raw)
+        filtered.append((raw, cleaned))
+
+    if not filtered:
+        return None
+
+    # Apply DESC_TRIGGER logic on cleaned text
+    n = len(filtered)
+    for idx, (raw, cleaned) in enumerate(filtered):
+        is_last = (idx == n - 1)
+        debug_utils._debug_log(
+            "description_processor: trigger_words", raw
+        )
+        if line_contains_any_word(cleaned, trigger_words) and not is_last:
+            continue
+        return (raw, cleaned)
+
+    return filtered[-1] if filtered else None
+
+
+# ---------------------------------------------------------------------------
+# Description builder
+# ---------------------------------------------------------------------------
+
+
+def build_description(text: str) -> str:
+    """
+    Build the final description string from raw POS-region text.
+
+    Algorithm:
+    1. Extract all bullet-item lines (starting with '#').
+    2. Clean each bullet line, discarding those whose cleaned text
+       is empty.
+    3. Apply FILTER_STRING and DESC_TRIGGER on the cleaned text to
+       select one candidate.
+    4. If the cleaned text is empty, return "".
+    5. If USE_COUNT is False, return the cleaned text.
+    6. If USE_COUNT is True, prefix with 'fr=<COUNT_VALUE>; '.
+    """
+    bullet_lines = collect_bullet_lines(text)
+
+    # NEW: clean all bullets first and drop empty-after-cleaning ones
+    candidates = build_cleaned_candidates(bullet_lines)
+    if not candidates:
+        debug_utils._debug_log("description_processor: chosen_line", "")
+        debug_utils._debug_log("description_processor: cleaned", "")
         return ""
 
-    if len(candidates) == 1:
-        return candidates[0][1]
+    chosen = select_bullet_line(candidates)
+    raw_line, cleaned = chosen if chosen else ("", "")
+    debug_utils._debug_log(
+        "description_processor: chosen_line", raw_line or ""
+    )
+    debug_utils._debug_log("description_processor: cleaned", cleaned)
 
-    raw1, clean1 = candidates[0]
-    _, clean2 = candidates[1]
-
-    triggers = parse_csv_values(DESC_TRIGGER)
-    if triggers and any(t in raw1 for t in triggers):
-        return clean2
-
-    return clean1
-
-
-def build_description(definition: str) -> str:
-    """
-    Build the final description string from raw definition text.
-
-    - Choose a cleaned bullet via choose_cleaned_bullet().
-    - If empty, return "".
-    - If USE_COUNT is False or COUNT_VALUE is zero/empty, return just the
-      cleaned bullet.
-    - Otherwise, return 'fr=<COUNT_VALUE>; <cleaned>'.
-    """
-    cleaned = choose_cleaned_bullet(definition)
     if not cleaned:
         return ""
 
     if not USE_COUNT:
         return cleaned
 
+    # USE_COUNT is True: normalize COUNT_VALUE.
     if COUNT_VALUE is None:
-        return cleaned
+        freq = ""
+    elif isinstance(COUNT_VALUE, str):
+        freq = COUNT_VALUE.strip()
+    else:
+        try:
+            ival = int(COUNT_VALUE)
+            freq = "" if ival == 0 else str(ival)
+        except Exception:
+            freq = ""
 
-    try:
-        if isinstance(COUNT_VALUE, str):
-            c_str = COUNT_VALUE.strip()
-            if not c_str or c_str == "0":
-                return cleaned
-            freq = c_str
-        else:
-            if int(COUNT_VALUE) == 0:
-                return cleaned
-            freq = str(COUNT_VALUE)
-    except Exception:
-        return cleaned
+    return f"fr={freq}; {cleaned}".strip()
 
-    return f"fr={freq}; {cleaned}"
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 
 def process_description(text: str) -> str:
@@ -256,4 +342,5 @@ def process_description(text: str) -> str:
     'text' is the raw POS description region for a single POS section.
     Returns the final cleaned description string or "".
     """
+    debug_utils._debug_log("description_processor: input", text)
     return build_description(text)

@@ -16,3 +16,4 @@
 -hy-հատ-  PLC
 -hy-հպվ-  ABBR
 -hy-բնձ-  NAT
+-hy-անվ-  NOML

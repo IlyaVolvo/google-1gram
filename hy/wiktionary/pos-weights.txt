@@ -1,4 +1,5 @@
 # POS weights for --single=y
+NOML 13
 NOUN 12
 ADJ 11
 VERB 10
