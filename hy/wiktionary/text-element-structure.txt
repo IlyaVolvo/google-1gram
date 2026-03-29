@@ -1,0 +1,44 @@
+  <page>
+    <title>խորոված</title>
+    
+	<!-- elements or opening XML tags -->
+	
+		<text bytes="2164" sha1="rtgbsa3czaj2b8dtteocoz23zil2nqs" xml:space="preserve">'
+	<!-- language tag like {{-hy-}} -->
+	<!-- Some optional text with or without wikimarkup might be here -->	
+
+== Ստուգաբանություն ==
+	<!-- Some optional text with or without wikimarkup might be here -->	
+	
+	<!-- POS section
+		<!-- Line that contains POS tags like in {{-hy-<pos>-}} format like {{-hy-բայ-}} for VERB -->
+		<!-- POS tag section description -->
+		
+		<!-- Bullet-items starting with "# " of the <title> word definitions 
+		# 
+		# 
+		...
+		-->
+		
+		<!-- Line that contains POS tags like in {{-hy-<pos>-}} format like {{-hy-բայ-}} for VERB -->
+		<!-- POS tag section description -->
+		<!-- Bullet-items starting with "# " of the <title> word definitions 
+		# 
+		# 
+		...
+		-->
+	 -->
+	<!-- Some optional text with or without wikimarkup might be here -->	
+
+==== Հոմանիշներ ====
+		<!-- Bullet-items with the <title> word synonyms
+		# 
+		# 
+		...
+		-->
+	<!-- Some optional text with or without wikimarkup might be here -->	
+
+	<!-- elements or closing XML tags -->
+	</text>
+  </page>
+  
