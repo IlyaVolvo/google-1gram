@@ -21,6 +21,7 @@ description_processor.
 import debug_utils
 import re
 from typing import List, Tuple
+from typing import Dict
 import description_processor as dp
 import text_processor as tp
 
@@ -30,7 +31,7 @@ import text_processor as tp
 
 DEBUG_WORD: str = ""          # set externally from page_element_processor
 DEBUG_FILE: str = "debug.txt"  # output file for debugging
-
+NAME_POS_FILE = "name-pos.txt"
 
 def _debug_dump(label: str, text: str) -> None:
     """
@@ -119,6 +120,82 @@ def extract_pos_regions(lines: List[str]) -> List[Tuple[int, int, str]]:
 # Pre-processors
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# pp0: Map Armenian POS headers to {{hy-<pos>-}} templates
+# ---------------------------------------------------------------------------
+
+# Matches headers of any level: = Գոյական =, == Գոյական ==, etc.
+HEADER_RE = re.compile(
+    r"^(?P<eq>=+)\s*(?P<name>[^=]+?)\s*(?P=eq)\s*$"
+)
+
+def _load_name_pos_map() -> Dict[str, str]:
+    """
+    Load the name→pos map from NAME_POS_FILE.
+
+    File format (UTF-8 text, one mapping per line, '#' allowed for comments):
+
+        Ածական,ած
+        Գոյական,գո
+        Մակբայ,մակ
+        Դերանուն,դեր
+    """
+    mapping: Dict[str, str] = {}
+    try:
+        with open(NAME_POS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                parts = [p.strip() for p in raw.split(",")]
+                if len(parts) != 2:
+                    continue
+                name, pos = parts
+                if name and pos:
+                    mapping[name] = pos
+    except FileNotFoundError:
+        # If the map file is missing, pp0 becomes a no-op.
+        pass
+    return mapping
+
+
+def pp0(text: str) -> str:
+    """
+    pp0: Replace Armenian POS headers with {{-hy-<pos>-}} templates.
+
+    Rules:
+    1) Select header '=== ===' of any level (any number of '=').
+    2) If <name> is in name-pos.txt map, replace the entire header line
+       with '{{-hy-<pos>-}}', e.g. '=== Գոյական ===' -> '{{-hy-գո-}}'.
+    3) Otherwise leave the line unchanged.
+    """
+    debug_utils._debug_log("pp0", text)
+
+    name_pos = _load_name_pos_map()
+    if not name_pos:
+        return text
+
+    lines = text.splitlines()
+    if not lines:
+        return text
+
+    new_lines: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        m = HEADER_RE.match(stripped)
+        if not m:
+            new_lines.append(line)
+            continue
+
+        name = m.group("name").strip()
+        pos = name_pos.get(name)
+        if pos:
+            # Correct POS template form: {{-hy-<pos>-}}
+            new_lines.append(f"{{{{-hy-{pos}-}}}}")
+        else:
+            new_lines.append(line)
+
+    return "\n".join(new_lines)      
 
 def pp1(text: str) -> str:
     """
@@ -213,6 +290,8 @@ def pp2(text: str) -> str:
 
          prepend '# ' to that line.
     """
+    debug_utils._debug_log("pp2", text)
+    
     lines = text.splitlines()
     if not lines:
         return text
@@ -363,8 +442,8 @@ def pp3(text: str) -> str:
 
     return out
 
-
 PRE_PROCESSORS = {
+    "pp0": pp0,
     "pp1": pp1,
     "pp2": pp2,
     "pp3": pp3,
