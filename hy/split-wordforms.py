@@ -4,14 +4,15 @@ Design: Aram
 Coding: Perplexity
 Date: 2026-π
 
-split-wordforms.py for Armenian: ել ում ած եր ով իկ ող
+split-wordforms.py
 
 Takes a text file with one record per line in the format:
 
-    <word><space><text>
+    <word><separator><text>
 
-and a list of suffixes. It moves records whose <word> ends with these suffixes
-into separate files named:
+where <separator> is any of: space, tab, comma, period, dash, colon.
+It moves records whose <word> ends with the given suffixes into separate files
+named:
 
     <name>-<suffix>.txt
 
@@ -27,6 +28,9 @@ import argparse
 import os
 from collections import defaultdict
 
+# Characters that can separate the word from the rest of the line
+SEPARATORS = set(" \t.,:-")  # space, tab, comma, period, dash, colon
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -34,7 +38,7 @@ def parse_args():
     )
     parser.add_argument(
         "input_file",
-        help="Input text file with lines of the form '<word> <text>'.",
+        help="Input text file with lines of the form '<word><separator><text>'.",
     )
     parser.add_argument(
         "--suffix",
@@ -45,6 +49,17 @@ def parse_args():
         help="One or more suffixes to split on (e.g. --suffix ing ed s).",
     )
     return parser.parse_args()
+
+
+def split_first(line: str):
+    """
+    Split line into (word, rest) at the first separator character.
+    If no separator is found, returns (line, '').
+    """
+    for idx, ch in enumerate(line):
+        if ch in SEPARATORS:
+            return line[:idx], line[idx:]  # rest includes the separator
+    return line, ""  # no separator found
 
 
 def main():
@@ -62,26 +77,24 @@ def main():
     }
 
     # First pass: read all lines and classify them
-    # mapping suffix -> list of lines, and list of remaining lines
     matched_lines = defaultdict(list)
     remaining_lines = []
 
     with open(input_file, "r", encoding="utf-8") as f:
         for line in f:
+            # Keep original line ending (newline) for output
             stripped = line.rstrip("\n")
             if not stripped:
                 # empty line goes back to remaining_lines unchanged
                 remaining_lines.append(line)
                 continue
 
-            # Split only on first space: word, rest_of_text
-            parts = stripped.split(" ", 1)
-            word = parts[0]
+            word, _ = split_first(stripped)  # we only need the word for suffix test
 
             moved = False
             for suf in suffixes:
                 if word.endswith(suf):
-                    matched_lines[suf].append(line)
+                    matched_lines[suf].append(line)  # write original line (with newline)
                     moved = True
                     break
             if not moved:
@@ -90,7 +103,6 @@ def main():
     # Write out files for each suffix
     for suf, path in suffix_to_path.items():
         lines = matched_lines.get(suf, [])
-        # Overwrite if exists; create otherwise
         with open(path, "w", encoding="utf-8") as out_f:
             out_f.writelines(lines)
 
